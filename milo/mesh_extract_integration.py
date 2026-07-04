@@ -62,7 +62,7 @@ def marching_tetrahedra_with_binary_search(
             print(f"[INFO] Using all {n_gaussians_to_sample_from} Gaussians for generating pivots.")
                 
     # Generate Gaussian pivots
-    points, points_scale = gaussians.get_tetra_points(xyz_idx=delaunay_xyz_idx)
+    points, points_scale, _ = gaussians.get_tetra_points(xyz_idx=delaunay_xyz_idx)
     print(f"[INFO] Extracted {points.shape[0]} Delaunay sites from Gaussians.")
     t0 = time.time()
     

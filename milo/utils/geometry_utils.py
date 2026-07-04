@@ -208,15 +208,31 @@ def is_in_view_frustum(
     return valid_mask
 
 
-def unflatten_voronoi_features(voronoi_features:torch.Tensor, n_voronoi_per_gaussians:int=9):
+def unflatten_voronoi_features(voronoi_features:torch.Tensor, n_voronoi_per_gaussians:int=9, keep_mask:torch.Tensor=None, fill_value:float=0.0):
     """Unflatten the voronoi features into a 3D tensor with shape (n_gaussians, n_voronoi_per_gaussians, *voronoi_features.shape[1:]).
 
     Args:
-        voronoi_features (torch.Tensor): Tensor with shape (n_gaussians * n_voronoi_per_gaussians, *voronoi_features.shape[1:]).
+        voronoi_features (torch.Tensor): Tensor with shape (n_gaussians * n_voronoi_per_gaussians, *voronoi_features.shape[1:]),
+            or, if keep_mask is provided, shape (keep_mask.sum(), *voronoi_features.shape[1:]).
+        keep_mask (torch.Tensor, optional): Boolean mask of shape (n_gaussians, n_voronoi_per_gaussians) indicating
+            which of the n_voronoi_per_gaussians slots are present in voronoi_features, in row-major
+            (gaussian-major, slot-minor) order. If provided, slots not covered by the mask are filled with
+            fill_value. Defaults to None (legacy fixed-layout behavior).
+        fill_value (float, optional): Value used for slots not covered by keep_mask. Defaults to 0.0.
 
     Returns:
         torch.Tensor: Tensor with shape (n_gaussians, n_voronoi_per_gaussians, *voronoi_features.shape[1:]).
     """
+    if keep_mask is not None:
+        out = torch.full(
+            (*keep_mask.shape, *voronoi_features.shape[1:]),
+            fill_value,
+            dtype=voronoi_features.dtype,
+            device=voronoi_features.device,
+        )
+        out[keep_mask] = voronoi_features
+        return out
+
     n_gaussians = len(voronoi_features) // n_voronoi_per_gaussians
     return torch.cat(
         [
@@ -225,9 +241,24 @@ def unflatten_voronoi_features(voronoi_features:torch.Tensor, n_voronoi_per_gaus
         ],
         dim=1
     ).reshape(n_gaussians, n_voronoi_per_gaussians, *voronoi_features.shape[1:])
-    
-    
-def flatten_voronoi_features(voronoi_features:torch.Tensor, n_voronoi_per_gaussians:int=9):
+
+
+def flatten_voronoi_features(voronoi_features:torch.Tensor, n_voronoi_per_gaussians:int=9, keep_mask:torch.Tensor=None):
+    """Flatten a per-Gaussian (n_gaussians, n_voronoi_per_gaussians, ...) feature tensor into a
+    flat per-Delaunay-site tensor.
+
+    Args:
+        voronoi_features (torch.Tensor): Shape (n_gaussians, n_voronoi_per_gaussians, ...).
+        keep_mask (torch.Tensor, optional): Boolean mask of shape (n_gaussians, n_voronoi_per_gaussians)
+            indicating which slots are active. If provided, only active slots are kept, flattened in
+            row-major (gaussian-major, slot-minor) order. Defaults to None (legacy fixed-layout behavior).
+
+    Returns:
+        torch.Tensor: Flat tensor, shape (n_gaussians * n_voronoi_per_gaussians, ...) or (keep_mask.sum(), ...).
+    """
+    if keep_mask is not None:
+        return voronoi_features[keep_mask]
+
     return torch.cat(
         [
             voronoi_features[:, :n_voronoi_per_gaussians-1].reshape(-1, *voronoi_features.shape[2:]),

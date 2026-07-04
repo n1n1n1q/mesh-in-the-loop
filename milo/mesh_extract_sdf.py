@@ -108,11 +108,14 @@ def extract_mesh_with_sdf_refinement(
             delaunay_xyz_idx = None
             print(f"[INFO] No need to downsample the {n_gaussians_to_sample_from} Delaunay Gaussians.")
 
-        voronoi_points, voronoi_scales = gaussians.get_tetra_points(
+        voronoi_points, voronoi_scales, voronoi_keep_mask = gaussians.get_tetra_points(
             downsample_ratio=None,
             let_gradients_flow=False,
             xyz_idx=delaunay_xyz_idx, # Pass the computed indices
-            verbose=True
+            verbose=True,
+            use_adaptive_pivot_sampling=mesh_config.get("use_adaptive_pivot_sampling", False),
+            gaussian_type_linear_ratio=mesh_config.get("gaussian_type_linear_ratio", 3.0),
+            gaussian_type_planar_ratio=mesh_config.get("gaussian_type_planar_ratio", 3.0),
         )
                 
     # Compute Delaunay triangulation
@@ -184,10 +187,15 @@ def extract_mesh_with_sdf_refinement(
             )  # Between -1 and 1
             base_occupancy = convert_sdf_to_occupancy(base_occupancy)  # Between 0.005 and 0.995
             
-            # Reshape base occupancy to make it (N_sampled_gaussians, 9)
+            # Reshape base occupancy to make it (N_sampled_gaussians, 9).
+            # Masked-out slots are filled with the NEUTRAL occupancy 0.5, not 0.0: reset_occupancy
+            # applies inverse_sigmoid, and inverse_sigmoid(0.0) = -inf would poison the occupancy
+            # parameters with -inf/NaN. See the matching note in regularization/regularizer/mesh.py.
             base_occupancy = unflatten_voronoi_features(
-                base_occupancy, 
-                n_voronoi_per_gaussians=9
+                base_occupancy,
+                n_voronoi_per_gaussians=9,
+                keep_mask=voronoi_keep_mask,
+                fill_value=0.5,
             )  # (N_sampled_gaussians, 9)
             
             # Reset occupancy
@@ -246,7 +254,7 @@ def extract_mesh_with_sdf_refinement(
         else:
             current_occupancy = gaussians.get_occupancy  # (N_gaussians, 9)
         current_voronoi_sdf = convert_occupancy_to_sdf(
-                flatten_voronoi_features(current_occupancy)
+                flatten_voronoi_features(current_occupancy, keep_mask=voronoi_keep_mask)
             )  # (N_voronoi_points, )
         
         # Differentiable Marching Tetrahedra
@@ -400,7 +408,8 @@ def extract_mesh_with_sdf_refinement(
                 torch.nn.functional.binary_cross_entropy_with_logits(
                     flatten_voronoi_features(
                         gaussians.get_occupancy_logit if delaunay_xyz_idx is None
-                        else gaussians.get_occupancy_logit[delaunay_xyz_idx]
+                        else gaussians.get_occupancy_logit[delaunay_xyz_idx],
+                        keep_mask=voronoi_keep_mask,
                     ),
                     occupancy_labels
                 )
@@ -459,7 +468,7 @@ def extract_mesh_with_sdf_refinement(
         else:
             current_occupancy = gaussians.get_occupancy  # (N_gaussians, 9)
         current_voronoi_sdf = convert_occupancy_to_sdf(
-                flatten_voronoi_features(current_occupancy)
+                flatten_voronoi_features(current_occupancy, keep_mask=voronoi_keep_mask)
             )  # (N_voronoi_points, )
         
         # Differentiable Marching Tetrahedra

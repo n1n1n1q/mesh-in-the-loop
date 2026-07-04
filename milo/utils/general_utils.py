@@ -11,6 +11,7 @@
 
 import torch
 import sys
+import math
 from datetime import datetime
 import numpy as np
 import random
@@ -97,6 +98,108 @@ def build_rotation(r):
     R[:, 2, 1] = 2 * (y*z + r*x)
     R[:, 2, 2] = 1 - 2 * (x*x + y*y)
     return R
+
+def classify_gaussian_types(
+    log_scale:torch.Tensor,
+    linear_ratio:float=3.0,
+    planar_ratio:float=3.0,
+) -> torch.Tensor:
+    """Classify Gaussians as volumetric, planar or linear from their (log-space) scale.
+
+    Gaussians are classified by comparing the gaps between sorted log-scales
+    (l0 >= l1 >= l2) against epsilon thresholds derived from the given ratios
+    (a gap of eps=log(ratio) in log-space corresponds to a ratio-x difference
+    in linear scale space). Comparing gaps instead of ratios avoids division.
+
+    Args:
+        log_scale (torch.Tensor): Log-space scale of the Gaussians. Shape: (N, 3).
+        linear_ratio (float, optional): Ratio threshold for the largest scale to dominate
+            both other axes for a Gaussian to be classified as "linear". Defaults to 3.0.
+        planar_ratio (float, optional): Ratio threshold for the two largest scales to dominate
+            the smallest axis for a Gaussian to be classified as "planar". Defaults to 3.0.
+
+    Returns:
+        torch.Tensor: Gaussian type codes. Shape: (N,). 0=volumetric, 1=planar, 2=linear.
+    """
+    sorted_log_scale = torch.sort(log_scale, dim=-1, descending=True)[0]
+    gap_major = sorted_log_scale[:, 0] - sorted_log_scale[:, 1]
+    gap_minor = sorted_log_scale[:, 1] - sorted_log_scale[:, 2]
+
+    eps_linear = math.log(linear_ratio)
+    eps_planar = math.log(planar_ratio)
+
+    is_linear = gap_major > eps_linear
+    is_planar = (~is_linear) & (gap_minor > eps_planar)
+
+    gaussian_type = torch.zeros(log_scale.shape[0], dtype=torch.int8, device=log_scale.device)
+    gaussian_type[is_planar] = 1
+    gaussian_type[is_linear] = 2
+    return gaussian_type
+
+def compute_pivot_keep_mask(
+    log_scale:torch.Tensor,
+    corner_signs:torch.Tensor,
+    linear_ratio:float=3.0,
+    planar_ratio:float=3.0,
+) -> torch.Tensor:
+    """Compute a per-Gaussian keep-mask selecting which of the 9 canonical pivot slots
+    (8 bounding-box corners + 1 center, in that order) should be used as Delaunay sites.
+
+    Volumetric Gaussians keep all 8 corners. Planar and linear Gaussians keep a corner
+    subset chosen to stay symmetric around the center along the axes being collapsed,
+    rather than collapsing to one side of the Gaussian -- a one-sided reduction removes
+    the local 3D thickness that keeps nearby tetrahedra well-conditioned, which is
+    especially risky for planar Gaussians since they are extremely common on flat
+    surfaces and a whole contiguous flat region losing its off-plane spread can degrade
+    the Delaunay triangulation into slivers there:
+      - Planar Gaussians keep the 4 corners forming a regular tetrahedron inscribed in
+        the bounding box (the corners where sign_dominant * sign_mid * sign_minor == 1).
+        This covers all 4 (dominant, mid) sign combinations exactly once, each paired
+        with an alternating minor-axis sign, so the kept points remain balanced on both
+        sides of the collapsed (minor) axis instead of only one.
+      - Linear Gaussians keep 1 pair of antipodal corners (all three signs identical,
+        i.e. (+1,+1,+1) and (-1,-1,-1)), which differ maximally along the dominant axis
+        while also being symmetric (through the center) along the two collapsed axes.
+    The center (slot 8) is always kept.
+
+    Args:
+        log_scale (torch.Tensor): Log-space scale of the Gaussians. Shape: (N, 3).
+        corner_signs (torch.Tensor): Sign pattern of the 8 canonical box corners
+            (the same corners used to build the pivot points), values in {-1, 1}.
+            Shape: (8, 3).
+        linear_ratio (float, optional): See `classify_gaussian_types`. Defaults to 3.0.
+        planar_ratio (float, optional): See `classify_gaussian_types`. Defaults to 3.0.
+
+    Returns:
+        torch.Tensor: Boolean keep-mask. Shape: (N, 9).
+    """
+    n_gaussians = log_scale.shape[0]
+    device = log_scale.device
+
+    gaussian_type = classify_gaussian_types(log_scale, linear_ratio=linear_ratio, planar_ratio=planar_ratio)
+    # rank[:, 0] = index of the dominant (largest-scale) axis, rank[:, 2] = most-minor axis
+    rank = torch.argsort(log_scale, dim=-1, descending=True)
+
+    # For each Gaussian and each of the 8 corners, reorder the corner's sign vector
+    # so that column order becomes [dominant axis sign, mid axis sign, minor axis sign].
+    signs = corner_signs.to(device).unsqueeze(0).expand(n_gaussians, 8, 3)
+    rank_expanded = rank.unsqueeze(1).expand(n_gaussians, 8, 3)
+    signs_ranked = torch.gather(signs, dim=2, index=rank_expanded)
+
+    keep_volumetric = torch.ones(n_gaussians, 8, dtype=torch.bool, device=device)
+    # Alternating (tetrahedral) subset: even number of -1 signs, i.e. product of signs == 1.
+    keep_planar = (signs_ranked[..., 0] * signs_ranked[..., 1] * signs_ranked[..., 2]) == 1
+    # Antipodal pair: all three signs identical (either all +1 or all -1).
+    keep_linear = (signs_ranked[..., 0] == signs_ranked[..., 1]) & (signs_ranked[..., 1] == signs_ranked[..., 2])
+
+    keep_corners = torch.where(
+        (gaussian_type == 2).unsqueeze(-1),
+        keep_linear,
+        torch.where((gaussian_type == 1).unsqueeze(-1), keep_planar, keep_volumetric),
+    )
+
+    keep_center = torch.ones(n_gaussians, 1, dtype=torch.bool, device=device)
+    return torch.cat([keep_corners, keep_center], dim=1)
 
 def build_scaling_rotation(s, r):
     L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device="cuda")

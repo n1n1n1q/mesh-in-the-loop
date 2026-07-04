@@ -77,7 +77,7 @@ def extract_mesh(
     # Extract pivots from Gaussians.
     # If override_pivots is provided, use it instead of extracting pivots from Gaussians.
     if override_pivots is None:
-        pivots, pivots_scale = extract_gaussian_pivots(
+        pivots, pivots_scale, _ = extract_gaussian_pivots(
             means=means,
             scales=scales,
             rotations=rotations,

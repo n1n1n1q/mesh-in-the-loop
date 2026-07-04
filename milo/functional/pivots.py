@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import trimesh
 from scene.cameras import Camera
-from utils.general_utils import build_rotation
+from utils.general_utils import build_rotation, compute_pivot_keep_mask
 from functional.func_utils import _init_cdf_mask, _render_simp
 
 
@@ -182,9 +182,14 @@ def extract_gaussian_pivots(
     gaussian_idx:Union[torch.Tensor, None]=None,
     scale_pivots_with_downsample_ratio:bool=True,
     scale_pivots_factor:float=None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    use_adaptive_pivot_sampling:bool=False,
+    gaussian_type_linear_ratio:float=3.0,
+    gaussian_type_planar_ratio:float=3.0,
+    override_keep_mask:Union[torch.Tensor, None]=None,
+) -> Tuple[torch.Tensor, torch.Tensor, Union[torch.Tensor, None]]:
     """Extract pivots from Gaussians, in a differentiable manner.
-    Each Gaussian will spawn 9 pivots.
+    Each Gaussian will spawn 9 pivots, unless use_adaptive_pivot_sampling is True, in which case
+    each Gaussian will spawn 9 (volumetric), 5 (planar) or 3 (linear) pivots depending on its shape.
     A list of indices can be provided to generate pivots only for a subset of Gaussians.
     We recommend to use only Gaussians that are located on or near the surface;
     indices of such Gaussians can be obtained by calling sample_gaussians_on_surface(...).
@@ -193,27 +198,43 @@ def extract_gaussian_pivots(
         means (torch.Tensor): Means of the Gaussians. Shape: (N, 3).
         scales (torch.Tensor): Scales of the Gaussians. Shape: (N, 3).
         rotations (torch.Tensor): Rotations of the Gaussians as quaternions. Shape: (N, 4).
-        gaussian_idx (Union[torch.Tensor, None], optional): Indices of the Gaussians to be used for generating pivots. 
+        gaussian_idx (Union[torch.Tensor, None], optional): Indices of the Gaussians to be used for generating pivots.
             Shape: (N_selected,). Defaults to None.
         scale_pivots_with_downsample_ratio (bool, optional): If True, the scale of the pivots will be adjusted to match the downsample ratio. Defaults to True.
         scale_pivots_factor (float, optional): If provided, the scale of the pivots will be multiplied by this factor. Defaults to None.
+        use_adaptive_pivot_sampling (bool, optional): If True, classify each Gaussian as volumetric, planar
+            or linear from its scale, and only emit the subset of the 8 bounding-box corners relevant to
+            its shape (8 for volumetric, 4 for planar, 2 for linear), always keeping the center.
+            Defaults to False (legacy behavior: always 8 corners + center).
+        gaussian_type_linear_ratio (float, optional): Ratio threshold for "linear" classification.
+            Only used if use_adaptive_pivot_sampling is True. Defaults to 3.0.
+        gaussian_type_planar_ratio (float, optional): Ratio threshold for "planar" classification.
+            Only used if use_adaptive_pivot_sampling is True. Defaults to 3.0.
+        override_keep_mask (Union[torch.Tensor, None], optional): If provided, use this (N_selected, 9)
+            boolean mask directly instead of reclassifying Gaussians from their current scale. Required to
+            keep the corner/center layout consistent with a previously computed Delaunay triangulation
+            between two triangulation updates. Only used if use_adaptive_pivot_sampling is True.
+            Defaults to None (recompute the mask from the current scale).
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Pivots and their scales.
-            Pivots: Shape: (9*N_selected, 3).
-            Pivots_scale: Shape: (9*N_selected, 1).
+        Tuple[torch.Tensor, torch.Tensor, Union[torch.Tensor, None]]: Pivots, their scales, and a keep_mask.
+            Pivots: Shape: (9*N_selected, 3), or (M, 3) if use_adaptive_pivot_sampling is True.
+            Pivots_scale: Shape: (9*N_selected, 1), or (M, 1) if use_adaptive_pivot_sampling is True.
+            keep_mask: None if use_adaptive_pivot_sampling is False (legacy corners-then-centers layout).
+                Otherwise, boolean mask of shape (N_selected, 9) indicating which of the 8 corners + center
+                were emitted for each Gaussian, in row-major (gaussian-major, slot-minor) order.
     """
     M = trimesh.creation.box()
     M.vertices *= 2
-        
+
     xyz = means.clone()
     scale = scales.clone() * 3.
     rots = build_rotation(rotations.clone())
-    
+
     if gaussian_idx is not None:
         # Compute downsample ratio between the total number of Gaussians
         # and the number of Gaussians to be used for generating pivots.
-        downsample_ratio = gaussian_idx.shape[0] / xyz.shape[0]    
+        downsample_ratio = gaussian_idx.shape[0] / xyz.shape[0]
 
         # Select the Gaussians to be used for generating pivots.
         xyz = xyz[gaussian_idx]
@@ -225,21 +246,48 @@ def extract_gaussian_pivots(
             scale = scale / (downsample_ratio ** (1/3))
         elif scale_pivots_factor is not None:
             scale = scale * scale_pivots_factor
-    
-    pivots = M.vertices.T    
+
+    if use_adaptive_pivot_sampling:
+        if override_keep_mask is not None:
+            keep_mask = override_keep_mask
+        else:
+            log_scale = torch.log(scale.clamp(min=1e-12))
+            corner_signs = torch.from_numpy(M.vertices).float().to(xyz.device)
+            keep_mask = compute_pivot_keep_mask(
+                log_scale, corner_signs,
+                linear_ratio=gaussian_type_linear_ratio,
+                planar_ratio=gaussian_type_planar_ratio,
+            )  # (N, 9): 8 corners + center
+
+        corners = M.vertices.T
+        corners = torch.from_numpy(corners).float().cuda().unsqueeze(0).repeat(xyz.shape[0], 1, 1)
+        corners = corners * scale.unsqueeze(-1)
+        corners = torch.bmm(rots, corners).squeeze(-1) + xyz.unsqueeze(-1)
+        corners = corners.permute(0, 2, 1).contiguous()  # (N, 8, 3)
+
+        scale_max = scale.max(dim=-1, keepdim=True)[0]  # (N, 1)
+        pivots_full = torch.cat([corners, xyz.unsqueeze(1)], dim=1)  # (N, 9, 3)
+        scale_full = scale_max.unsqueeze(1).expand(-1, 9, -1)  # (N, 9, 1)
+
+        pivots = pivots_full[keep_mask].contiguous()
+        pivots_scale = scale_full[keep_mask].contiguous()
+
+        return pivots, pivots_scale, keep_mask
+
+    pivots = M.vertices.T
     pivots = torch.from_numpy(pivots).float().cuda().unsqueeze(0).repeat(xyz.shape[0], 1, 1)
-    
+
     # Reparameterization trick
     pivots = pivots * scale.unsqueeze(-1)
     pivots = torch.bmm(rots, pivots).squeeze(-1) + xyz.unsqueeze(-1)
     pivots = pivots.permute(0, 2, 1).reshape(-1, 3).contiguous()
-    
+
     # Concatenate center points
     pivots = torch.cat([pivots, xyz], dim=0)
-    
+
     # Scale is not a good solution but use it for now
     scale = scale.max(dim=-1, keepdim=True)[0]
     scale_corner = scale.repeat(1, 8).reshape(-1, 1)
     pivots_scale = torch.cat([scale_corner, scale], dim=0)
-    
-    return pivots, pivots_scale
+
+    return pivots, pivots_scale, None

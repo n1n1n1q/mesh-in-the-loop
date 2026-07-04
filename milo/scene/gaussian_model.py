@@ -23,6 +23,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.appearance_network import AppearanceNetwork
 from utils.sh_utils import SH2RGB
+from utils.general_utils import compute_pivot_keep_mask
 import trimesh
 
 try:
@@ -408,15 +409,19 @@ class GaussianModel:
             self._occupancy_shift = nn.Parameter(occupancy_shift.requires_grad_(True))  # Learn occupancy shift
         
     def _get_tetra_points(
-        self, 
-        downsample_ratio:float=None, 
-        return_sdf_values:bool=False, 
-        xyz_idx:torch.Tensor=None, 
+        self,
+        downsample_ratio:float=None,
+        return_sdf_values:bool=False,
+        xyz_idx:torch.Tensor=None,
         verbose:bool=False,
         scale_points_with_downsample_ratio:bool=True,
         scale_points_factor:float=None,
         opacity_threshold:float=None,
         override_opacity:torch.Tensor=None,
+        use_adaptive_pivot_sampling:bool=False,
+        gaussian_type_linear_ratio:float=3.0,
+        gaussian_type_planar_ratio:float=3.0,
+        override_keep_mask:torch.Tensor=None,
     ):
         """
         Get the tetra points of the Gaussian model.
@@ -424,23 +429,42 @@ class GaussianModel:
         Args:
             downsample_ratio (float, optional): The ratio to downsample the tetra points. Defaults to None.
             return_sdf_values (bool, optional): Whether to return the SDF values. Defaults to False.
-            xyz_idx (torch.Tensor, optional): The indices of the tetra points to return. 
+            xyz_idx (torch.Tensor, optional): The indices of the tetra points to return.
                 If opacity_threshold is provided, xyz_idx should index points that are not filtered out by the opacity threshold,
                 such that xyz_idx.max() < (self.get_opacity_with_3D_filter > opacity_threshold).sum().
-                Defaults to None. 
+                Defaults to None.
                 Overrides downsample_ratio if both are provided.
             verbose (bool, optional): Whether to print verbose information. Defaults to False.
-            scale_points_with_downsample_ratio (bool, optional): Whether to scale the points with the downsample ratio. 
+            scale_points_with_downsample_ratio (bool, optional): Whether to scale the points with the downsample ratio.
                 Defaults to True. Overrides scale_points_factor if both are provided.
             scale_points_factor (float, optional): The factor to scale the points. Defaults to None.
             opacity_threshold (float, optional): The opacity threshold to filter the points. Defaults to None.
-            override_opacity (torch.Tensor, optional): The opacities to use for the tetra points. 
+            override_opacity (torch.Tensor, optional): The opacities to use for the tetra points.
+            use_adaptive_pivot_sampling (bool, optional): If True, classify each Gaussian as volumetric,
+                planar or linear from its scale, and only emit the subset of the 8 bounding-box corners
+                relevant to its shape (8 for volumetric, 4 for planar, 2 for linear), always keeping the
+                center. Defaults to False (legacy behavior: always 8 corners + center).
+            gaussian_type_linear_ratio (float, optional): Ratio threshold for "linear" classification.
+                Only used if use_adaptive_pivot_sampling is True. Defaults to 3.0.
+            gaussian_type_planar_ratio (float, optional): Ratio threshold for "planar" classification.
+                Only used if use_adaptive_pivot_sampling is True. Defaults to 3.0.
+            override_keep_mask (torch.Tensor, optional): If provided, use this (n_gaussians, 9) boolean
+                mask directly instead of reclassifying Gaussians from their current scale. This is required
+                to keep the corner/center layout of the emitted points consistent with a previously computed
+                Delaunay triangulation (which references vertices by index): the mask must stay fixed between
+                two triangulation updates, even though Gaussian scale (and hence classification) can drift
+                every iteration. Only used if use_adaptive_pivot_sampling is True. Defaults to None (recompute
+                the mask from the current scale).
         Raises:
             ValueError: If SDF values are not used but return_sdf_values is True.
 
         Returns:
             vertices (torch.Tensor): The vertices of the tetra points.
             vertices_scale (torch.Tensor): The scale of the vertices.
+            keep_mask (torch.Tensor or None): Boolean mask of shape (n_gaussians, 9), indicating which of
+                the 8 corners + center were emitted for each Gaussian, in row-major (gaussian-major,
+                slot-minor) order. None if use_adaptive_pivot_sampling is False, in which case vertices
+                follows the legacy layout (all corners of all Gaussians, followed by all centers).
             sdf_values (torch.Tensor, optional): The SDF values of the tetra points.
         """
         M = trimesh.creation.box()
@@ -506,24 +530,51 @@ class GaussianModel:
             if verbose:
                 print(f"[INFO] Number of tetra points after downsampling: {xyz.shape[0] * 9}.")
         
-        vertices = M.vertices.T    
-        vertices = torch.from_numpy(vertices).float().cuda().unsqueeze(0).repeat(xyz.shape[0], 1, 1)
-        # scale vertices first
-        vertices = vertices * scale.unsqueeze(-1)
-        vertices = torch.bmm(rots, vertices).squeeze(-1) + xyz.unsqueeze(-1)
-        vertices = vertices.permute(0, 2, 1).reshape(-1, 3).contiguous()
-        # concat center points
-        vertices = torch.cat([vertices, xyz], dim=0)
-        
-        # scale is not a good solution but use it for now
-        scale = scale.max(dim=-1, keepdim=True)[0]
-        scale_corner = scale.repeat(1, 8).reshape(-1, 1)
-        vertices_scale = torch.cat([scale_corner, scale], dim=0)
-        
-        if return_sdf_values:
-            return vertices, vertices_scale, sdf_values
+        if use_adaptive_pivot_sampling:
+            if override_keep_mask is not None:
+                keep_mask = override_keep_mask
+            else:
+                log_scale = torch.log(scale.clamp(min=1e-12))
+                corner_signs = torch.from_numpy(M.vertices).float().to(xyz.device)
+                keep_mask = compute_pivot_keep_mask(
+                    log_scale, corner_signs,
+                    linear_ratio=gaussian_type_linear_ratio,
+                    planar_ratio=gaussian_type_planar_ratio,
+                )  # (N, 9): 8 corners + center
+
+            corners = M.vertices.T
+            corners = torch.from_numpy(corners).float().cuda().unsqueeze(0).repeat(xyz.shape[0], 1, 1)
+            corners = corners * scale.unsqueeze(-1)
+            corners = torch.bmm(rots, corners).squeeze(-1) + xyz.unsqueeze(-1)
+            corners = corners.permute(0, 2, 1).contiguous()  # (N, 8, 3)
+
+            scale_max = scale.max(dim=-1, keepdim=True)[0]  # (N, 1)
+            points_full = torch.cat([corners, xyz.unsqueeze(1)], dim=1)  # (N, 9, 3)
+            scale_full = scale_max.unsqueeze(1).expand(-1, 9, -1)  # (N, 9, 1)
+
+            vertices = points_full[keep_mask].contiguous()
+            vertices_scale = scale_full[keep_mask].contiguous()
         else:
-            return vertices, vertices_scale
+            keep_mask = None
+
+            vertices = M.vertices.T
+            vertices = torch.from_numpy(vertices).float().cuda().unsqueeze(0).repeat(xyz.shape[0], 1, 1)
+            # scale vertices first
+            vertices = vertices * scale.unsqueeze(-1)
+            vertices = torch.bmm(rots, vertices).squeeze(-1) + xyz.unsqueeze(-1)
+            vertices = vertices.permute(0, 2, 1).reshape(-1, 3).contiguous()
+            # concat center points
+            vertices = torch.cat([vertices, xyz], dim=0)
+
+            # scale is not a good solution but use it for now
+            scale = scale.max(dim=-1, keepdim=True)[0]
+            scale_corner = scale.repeat(1, 8).reshape(-1, 1)
+            vertices_scale = torch.cat([scale_corner, scale], dim=0)
+
+        if return_sdf_values:
+            return vertices, vertices_scale, keep_mask, sdf_values
+        else:
+            return vertices, vertices_scale, keep_mask
         
     def get_tetra_points(
         self, 

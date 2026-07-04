@@ -76,6 +76,7 @@ def initialize_mesh_regularization(
         "surface_delaunay_xyz_idx": None,
         "reset_delaunay_samples": True,
         "reset_sdf_values": True,
+        "voronoi_keep_mask": None,
     }
 
     return mesh_renderer, mesh_state
@@ -304,11 +305,26 @@ def compute_mesh_regularization(
 
         # Compute Voronoi generators
         # Pass delaunay_xyz_idx which might be None (use all), or indices after opacity/downsampling
-        voronoi_points, voronoi_scale = gaussians.get_tetra_points(
+        #
+        # NOTE: when use_adaptive_pivot_sampling is on, the number of corners emitted per Gaussian
+        # depends on its current scale, which drifts every iteration. The cached delaunay_tets
+        # references vertices by index into whatever point layout was used at the last
+        # triangulation, so the corner/center keep_mask MUST stay fixed between two
+        # triangulations (delaunay_tets is None <=> a new triangulation is about to be computed
+        # below), even though Gaussian scale keeps changing. Only recompute the mask when we are
+        # also about to recompute delaunay_tets; otherwise reuse the cached mask.
+        need_fresh_keep_mask = delaunay_tets is None
+        voronoi_points, voronoi_scale, voronoi_keep_mask = gaussians.get_tetra_points(
             downsample_ratio=None,
             let_gradients_flow=True,
             xyz_idx=delaunay_xyz_idx, # Pass the computed indices
+            use_adaptive_pivot_sampling=config.get("use_adaptive_pivot_sampling", False),
+            gaussian_type_linear_ratio=config.get("gaussian_type_linear_ratio", 3.0),
+            gaussian_type_planar_ratio=config.get("gaussian_type_planar_ratio", 3.0),
+            override_keep_mask=None if need_fresh_keep_mask else mesh_state["voronoi_keep_mask"],
         )
+        if config.get("use_adaptive_pivot_sampling", False):
+            mesh_state["voronoi_keep_mask"] = voronoi_keep_mask
         voronoi_points_count = voronoi_points.shape[0]
         # Recompute Delaunay tetrahedralization if needed
         if delaunay_tets is None:
@@ -371,10 +387,18 @@ def compute_mesh_regularization(
                 )  # Between -1 and 1
                 base_occupancy = convert_sdf_to_occupancy(base_occupancy)  # Between 0.005 and 0.995
                 
-                # Reshape base occupancy to make it (N_sampled_gaussians, 9)
+                # Reshape base occupancy to make it (N_sampled_gaussians, 9).
+                # With adaptive pivot sampling, masked-out slots (corners not emitted for this
+                # Gaussian's shape) are filled with the NEUTRAL occupancy 0.5, NOT 0.0: reset_occupancy
+                # applies inverse_sigmoid to these values, and inverse_sigmoid(0.0) = -inf would poison
+                # _base_occupancy / _occupancy_shift (-inf, and -inf - (-inf) = NaN). inverse_sigmoid(0.5) = 0
+                # keeps the unused slots finite and neutral, so if a later keep_mask refresh turns such a
+                # slot into an active Delaunay site it starts from a clean value until the next reset.
                 base_occupancy = unflatten_voronoi_features(
-                    base_occupancy, 
-                    n_voronoi_per_gaussians=9
+                    base_occupancy,
+                    n_voronoi_per_gaussians=9,
+                    keep_mask=voronoi_keep_mask,
+                    fill_value=0.5,
                 )  # (N_sampled_gaussians, 9)
                 
                 # Logic for resetting occupancy values
@@ -416,7 +440,7 @@ def compute_mesh_regularization(
         else:
             current_occupancy = gaussians.get_occupancy  # (N_gaussians, 9)
         current_voronoi_sdf = convert_occupancy_to_sdf(
-            flatten_voronoi_features(current_occupancy)
+            flatten_voronoi_features(current_occupancy, keep_mask=voronoi_keep_mask)
         )  # (N_voronoi_points, )
 
         # --- Marching Tetrahedra ---
@@ -478,11 +502,21 @@ def compute_mesh_regularization(
         
         # Reset occupancy labels
         if (
-            config["use_occupancy_labels_loss"] 
+            config["use_occupancy_labels_loss"]
             and (
                 (iteration % config["reset_occupancy_labels_every"] == 0)  # Every N iterations
                 or (iteration == config["start_iter"])  # First iteration
                 or reset_occupancy_labels_for_new_delaunay_sites  # If not fixing sites and downsampling, compute labels for sampled sites
+                # With use_adaptive_pivot_sampling, the per-Gaussian corner/center layout can change
+                # whenever the keep_mask is refreshed (every delaunay_reset_interval iterations), which is
+                # not necessarily in phase with reset_occupancy_labels_every. Two Gaussians can flip
+                # classification in opposite directions and leave the TOTAL point count unchanged while
+                # completely reshuffling which point maps to which cached label, so a size check alone is
+                # not enough: force a refresh in lockstep with every keep_mask/topology refresh.
+                or (need_fresh_keep_mask and config.get("use_adaptive_pivot_sampling", False))
+                # Defensive fallback: also force a refresh if the cached labels' size no longer matches the
+                # current point count, in case of any other desync.
+                or (voronoi_occupancy_labels is not None and voronoi_occupancy_labels.shape[0] != voronoi_points.shape[0])
             )
         ):
             print(f"[INFO] Resetting occupancy labels at iteration {iteration}.")
@@ -577,7 +611,8 @@ def compute_mesh_regularization(
                 torch.nn.functional.binary_cross_entropy_with_logits(
                     flatten_voronoi_features(
                         gaussians.get_occupancy_logit if delaunay_xyz_idx is None
-                        else gaussians.get_occupancy_logit[delaunay_xyz_idx]
+                        else gaussians.get_occupancy_logit[delaunay_xyz_idx],
+                        keep_mask=voronoi_keep_mask,
                     ),
                     voronoi_occupancy_labels
                 )

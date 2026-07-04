@@ -131,7 +131,7 @@ def compute_initial_sdf_values(
     assert method in ["depth_fusion", "integration"]
     
     if override_pivots is None:
-        pivots, _ = extract_gaussian_pivots(
+        pivots, _, _ = extract_gaussian_pivots(
             means=means,
             scales=scales,
             rotations=rotations,

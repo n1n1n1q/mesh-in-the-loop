@@ -20,6 +20,9 @@ n_max_points_in_delaunay: 5_400_000  # -1 for no limit
 delaunay_sampling_method: "surface"  # "random", "surface" or "surface+opacity"
 filter_large_edges: true  # true or false?
 collapse_large_edges: false  # true or false?
+use_adaptive_pivot_sampling: false   # type-adaptive corner-pivot count (9/5/3 for volumetric/planar/linear)
+gaussian_type_linear_ratio: 3.0      # log-scale gap threshold (as a ratio) for "linear" classification
+gaussian_type_planar_ratio: 3.0      # log-scale gap threshold (as a ratio) for "planar" classification
 
 # Rasterization
 use_scalable_renderer: false

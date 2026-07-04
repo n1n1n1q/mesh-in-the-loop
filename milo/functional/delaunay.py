@@ -42,7 +42,7 @@ def compute_delaunay_triangulation(
     # Extract pivots from Gaussians.
     # If override_pivots is provided, use it instead of extracting pivots from Gaussians.
     if override_pivots is None:
-        pivots, _ = extract_gaussian_pivots(
+        pivots, _, _ = extract_gaussian_pivots(
             means=means,
             scales=scales,
             rotations=rotations,
