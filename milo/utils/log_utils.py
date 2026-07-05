@@ -169,6 +169,7 @@ def log_training_progress(
     # Losses
     loss:torch.Tensor, depth_normal_loss:torch.Tensor, mesh_depth_loss:torch.Tensor,
     mesh_normal_loss:torch.Tensor, occupied_centers_loss:torch.Tensor, occupancy_labels_loss:torch.Tensor,
+    shape_reg_loss:torch.Tensor,
     depth_prior_loss:torch.Tensor,
     # Configs
     mesh_config:Dict[str, Any],
@@ -176,6 +177,7 @@ def log_training_progress(
     postfix_dict:Dict[str, Any], ema_loss_for_log:float, ema_depth_normal_loss_for_log:float,
     ema_mesh_depth_loss_for_log:float, ema_mesh_normal_loss_for_log:float,
     ema_occupied_centers_loss_for_log:float, ema_occupancy_labels_loss_for_log:float,
+    ema_shape_reg_loss_for_log:float,
     ema_depth_order_loss_for_log:float,
     # Additional arguments
     testing_iterations:List[int], saving_iterations:List[int], render_imp,
@@ -193,6 +195,8 @@ def log_training_progress(
             ema_occupied_centers_loss_for_log = 0.4 * occupied_centers_loss.item() + 0.6 * ema_occupied_centers_loss_for_log
         if mesh_config["use_occupancy_labels_loss"]:
             ema_occupancy_labels_loss_for_log = 0.4 * occupancy_labels_loss.item() + 0.6 * ema_occupancy_labels_loss_for_log
+        if mesh_config.get("use_type_shape_regularization", False):
+            ema_shape_reg_loss_for_log = 0.4 * shape_reg_loss.item() + 0.6 * ema_shape_reg_loss_for_log
     if depth_order_kick_on:
         ema_depth_order_loss_for_log = 0.4 * depth_prior_loss.item() + 0.6 * ema_depth_order_loss_for_log
     
@@ -209,6 +213,8 @@ def log_training_progress(
                 postfix_dict["OccLoss"] = f"{ema_occupied_centers_loss_for_log:.{7}f}"
             if mesh_config["use_occupancy_labels_loss"]:
                 postfix_dict["OccLabLoss"] = f"{ema_occupancy_labels_loss_for_log:.{7}f}"
+            if mesh_config.get("use_type_shape_regularization", False):
+                postfix_dict["ShapeRegLoss"] = f"{ema_shape_reg_loss_for_log:.{7}f}"
         postfix_dict["N_Gauss"] = f"{gaussians._xyz.shape[0]}"
         progress_bar.set_postfix(postfix_dict)
         progress_bar.update(10)
@@ -317,6 +323,7 @@ def log_training_progress(
         ema_loss_for_log, 
         ema_depth_normal_loss_for_log, 
         ema_mesh_depth_loss_for_log, ema_mesh_normal_loss_for_log, 
-        ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log, 
+        ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log,
+        ema_shape_reg_loss_for_log,
         ema_depth_order_loss_for_log
     )

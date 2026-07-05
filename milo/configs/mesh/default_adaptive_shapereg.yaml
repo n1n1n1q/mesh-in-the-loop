@@ -1,12 +1,12 @@
 # Regularization schedule
 start_iter: 8_001
-mesh_update_interval: 1 
+mesh_update_interval: 1
 stop_iter: 18000
 
 # Depth loss weight
 use_depth_loss: true
 depth_weight: 0.05  # 0.05
-depth_ratio: 1.0  # 0.6 
+depth_ratio: 1.0  # 0.6
 mesh_depth_loss_type: "log"  # "log"
 
 # Normal loss weight
@@ -16,20 +16,20 @@ use_depth_normal: true  # true
 
 # Delaunay computation
 delaunay_reset_interval: 500  # 500
-n_max_points_in_delaunay: 13_500_000  # -1 for no limit
-delaunay_sampling_method: "surface+opacity"  # "random", "surface" or "surface+opacity"
+n_max_points_in_delaunay: 5_400_000  # -1 for no limit
+delaunay_sampling_method: "surface"  # "random", "surface" or "surface+opacity"
 filter_large_edges: true  # true or false?
 collapse_large_edges: false  # true or false?
-use_adaptive_pivot_sampling: false   # type-adaptive corner-pivot count (9/5/3 for volumetric/planar/linear)
+use_adaptive_pivot_sampling: true    # type-adaptive corner-pivot count (9/5/3 for volumetric/planar/linear)
 gaussian_type_linear_ratio: 3.0      # log-scale gap threshold (as a ratio) for "linear" classification
 gaussian_type_planar_ratio: 3.0      # log-scale gap threshold (as a ratio) for "planar" classification
-use_type_shape_regularization: false  # freeze types at start_iter, then regularize shape per Gaussian type
+use_type_shape_regularization: true   # freeze types at start_iter, then regularize shape per Gaussian type
 shape_reg_weight: 0.01
 shape_reg_linear_target_ratio: 5.0    # target l0/l1 ratio pushed for linear Gaussians
 shape_reg_planar_target_ratio: 5.0    # target l1/l2 ratio pushed for planar Gaussians
 
 # Rasterization
-use_scalable_renderer: true
+use_scalable_renderer: false
 
 # SDF computation
 sdf_reset_interval: 500  # 500

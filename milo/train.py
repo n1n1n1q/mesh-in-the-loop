@@ -108,7 +108,8 @@ def training(
     ema_mesh_normal_loss_for_log = 0.0
     ema_occupied_centers_loss_for_log = 0.0
     ema_occupancy_labels_loss_for_log = 0.0
-    
+    ema_shape_reg_loss_for_log = 0.0
+
     # ---Prepare Depth-Order Regularization---    
     if args.depth_order:
         print("[INFO] Using depth order regularization.")
@@ -303,6 +304,7 @@ def training(
             mesh_normal_loss = mesh_regularization_pkg["mesh_normal_loss"]
             occupied_centers_loss = mesh_regularization_pkg["occupied_centers_loss"]
             occupancy_labels_loss = mesh_regularization_pkg["occupancy_labels_loss"]
+            shape_reg_loss = mesh_regularization_pkg["shape_reg_loss"]
             mesh_state = mesh_regularization_pkg["updated_state"]
             mesh_render_pkg = mesh_regularization_pkg["mesh_render_pkg"]
             
@@ -319,8 +321,9 @@ def training(
                 postfix_dict,
                 ema_loss_for_log, 
                 ema_depth_normal_loss_for_log, 
-                ema_mesh_depth_loss_for_log, ema_mesh_normal_loss_for_log, 
-                ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log, 
+                ema_mesh_depth_loss_for_log, ema_mesh_normal_loss_for_log,
+                ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log,
+                ema_shape_reg_loss_for_log,
                 ema_depth_order_loss_for_log
             ) = log_training_progress(
                 args, iteration, log_interval, progress_bar, run,
@@ -330,12 +333,14 @@ def training(
                 do_supervision_depth if depth_order_kick_on else None,
                 reg_kick_on, mesh_kick_on, depth_order_kick_on,
                 loss, depth_normal_loss if reg_kick_on else None, 
-                mesh_depth_loss if mesh_kick_on else None, mesh_normal_loss if mesh_kick_on else None, 
-                occupied_centers_loss if mesh_kick_on else None, occupancy_labels_loss if mesh_kick_on else None, 
+                mesh_depth_loss if mesh_kick_on else None, mesh_normal_loss if mesh_kick_on else None,
+                occupied_centers_loss if mesh_kick_on else None, occupancy_labels_loss if mesh_kick_on else None,
+                shape_reg_loss if mesh_kick_on else None,
                 depth_prior_loss if depth_order_kick_on else None,
-                mesh_config if mesh_kick_on else None, 
-                postfix_dict, ema_loss_for_log, ema_depth_normal_loss_for_log, ema_mesh_depth_loss_for_log, 
+                mesh_config if mesh_kick_on else None,
+                postfix_dict, ema_loss_for_log, ema_depth_normal_loss_for_log, ema_mesh_depth_loss_for_log,
                 ema_mesh_normal_loss_for_log, ema_occupied_centers_loss_for_log, ema_occupancy_labels_loss_for_log,
+                ema_shape_reg_loss_for_log,
                 ema_depth_order_loss_for_log, testing_iterations, saving_iterations, render_imp,
             )
 

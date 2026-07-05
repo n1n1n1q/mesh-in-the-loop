@@ -421,7 +421,7 @@ class GaussianModel:
         use_adaptive_pivot_sampling:bool=False,
         gaussian_type_linear_ratio:float=3.0,
         gaussian_type_planar_ratio:float=3.0,
-        override_keep_mask:torch.Tensor=None,
+        override_gaussian_types:torch.Tensor=None,
     ):
         """
         Get the tetra points of the Gaussian model.
@@ -448,13 +448,15 @@ class GaussianModel:
                 Only used if use_adaptive_pivot_sampling is True. Defaults to 3.0.
             gaussian_type_planar_ratio (float, optional): Ratio threshold for "planar" classification.
                 Only used if use_adaptive_pivot_sampling is True. Defaults to 3.0.
-            override_keep_mask (torch.Tensor, optional): If provided, use this (n_gaussians, 9) boolean
-                mask directly instead of reclassifying Gaussians from their current scale. This is required
-                to keep the corner/center layout of the emitted points consistent with a previously computed
-                Delaunay triangulation (which references vertices by index): the mask must stay fixed between
-                two triangulation updates, even though Gaussian scale (and hence classification) can drift
-                every iteration. Only used if use_adaptive_pivot_sampling is True. Defaults to None (recompute
-                the mask from the current scale).
+            override_gaussian_types (torch.Tensor, optional): Precomputed per-Gaussian type codes of
+                shape (n_gaussians,) (0=volumetric, 1=planar, 2=linear), e.g. a classification frozen at
+                the start of mesh regularization. If provided, the keep-mask is computed from these frozen
+                types instead of reclassifying from the current (drifting) scale, so the number of emitted
+                corners per Gaussian depends only on its frozen type (8/4/2 + center) and stays constant as
+                the scale evolves -- which keeps the emitted point count consistent with a cached Delaunay
+                triangulation without needing to freeze the whole mask. The per-axis ranking used to pick
+                corners is still derived from the current scale. Only used if use_adaptive_pivot_sampling is
+                True. Defaults to None (classify from the current scale).
         Raises:
             ValueError: If SDF values are not used but return_sdf_values is True.
 
@@ -531,16 +533,14 @@ class GaussianModel:
                 print(f"[INFO] Number of tetra points after downsampling: {xyz.shape[0] * 9}.")
         
         if use_adaptive_pivot_sampling:
-            if override_keep_mask is not None:
-                keep_mask = override_keep_mask
-            else:
-                log_scale = torch.log(scale.clamp(min=1e-12))
-                corner_signs = torch.from_numpy(M.vertices).float().to(xyz.device)
-                keep_mask = compute_pivot_keep_mask(
-                    log_scale, corner_signs,
-                    linear_ratio=gaussian_type_linear_ratio,
-                    planar_ratio=gaussian_type_planar_ratio,
-                )  # (N, 9): 8 corners + center
+            log_scale = torch.log(scale.clamp(min=1e-12))
+            corner_signs = torch.from_numpy(M.vertices).float().to(xyz.device)
+            keep_mask = compute_pivot_keep_mask(
+                log_scale, corner_signs,
+                linear_ratio=gaussian_type_linear_ratio,
+                planar_ratio=gaussian_type_planar_ratio,
+                gaussian_types=override_gaussian_types,
+            )  # (N, 9): 8 corners + center
 
             corners = M.vertices.T
             corners = torch.from_numpy(corners).float().cuda().unsqueeze(0).repeat(xyz.shape[0], 1, 1)

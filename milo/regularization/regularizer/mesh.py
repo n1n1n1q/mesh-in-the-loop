@@ -29,6 +29,10 @@ from utils.geometry_utils import (
     unflatten_voronoi_features,
     flatten_voronoi_features,
 )
+from utils.general_utils import (
+    classify_gaussian_types,
+    compute_type_shape_regularization,
+)
 
 # Try importing cpp extension, handle potential ImportError
 try:
@@ -60,6 +64,20 @@ def initialize_mesh_regularization(
     print("[INFO] Mesh regularization enabled.")
     print(f"         > Mesh depth loss type: {config['mesh_depth_loss_type']}")
     print(f"         > Occupancy mode: {config['occupancy_mode']}")
+    if config.get("use_type_shape_regularization", False):
+        if not config.get("use_adaptive_pivot_sampling", False):
+            print(
+                "[WARNING] use_type_shape_regularization is enabled but use_adaptive_pivot_sampling "
+                "is off. Gaussian types are only frozen on the adaptive-sampling path, so the shape "
+                "regularization will have no effect. Enable use_adaptive_pivot_sampling to use it."
+            )
+        else:
+            print(
+                "         > Type shape regularization enabled "
+                f"(weight={config.get('shape_reg_weight', 0.01)}, "
+                f"linear_target={config.get('shape_reg_linear_target_ratio', 5.0)}, "
+                f"planar_target={config.get('shape_reg_planar_target_ratio', 5.0)})."
+            )
         
     mesh_rasterizer = MeshRasterizer(cameras=scene.getTrainCameras().copy())
     if config["use_scalable_renderer"]:
@@ -76,7 +94,9 @@ def initialize_mesh_regularization(
         "surface_delaunay_xyz_idx": None,
         "reset_delaunay_samples": True,
         "reset_sdf_values": True,
-        "voronoi_keep_mask": None,
+        # Per-Gaussian type codes (0=volumetric, 1=planar, 2=linear) frozen once at the start of
+        # mesh regularization. Drives both the adaptive pivot keep-mask and the type shape reg.
+        "frozen_gaussian_types": None,
     }
 
     return mesh_renderer, mesh_state
@@ -220,6 +240,28 @@ def compute_mesh_regularization(
 
     # --- Main Mesh Regularization Computation ---
     if iteration >= config["start_iter"]:
+        # Freeze the per-Gaussian volumetric/planar/linear classification once, at the first mesh
+        # iteration. The Gaussian population is already fixed by this point (no densification /
+        # simplification past the start of mesh regularization), so a per-Gaussian (N,) type array
+        # stays valid for the rest of the run. Freezing keeps the adaptive pivot count per Gaussian
+        # constant (independent of scale drift) and provides a stable target for the type shape reg.
+        if config.get("use_adaptive_pivot_sampling", False) and mesh_state["frozen_gaussian_types"] is None:
+            with torch.no_grad():
+                log_scale_all = torch.log(gaussians.get_scaling.clamp(min=1e-12))
+                frozen_types = classify_gaussian_types(
+                    log_scale_all,
+                    linear_ratio=config.get("gaussian_type_linear_ratio", 3.0),
+                    planar_ratio=config.get("gaussian_type_planar_ratio", 3.0),
+                )
+            mesh_state["frozen_gaussian_types"] = frozen_types
+            print(
+                f"[INFO] Froze Gaussian types at iteration {iteration}: "
+                f"{(frozen_types == 0).sum().item()} volumetric, "
+                f"{(frozen_types == 1).sum().item()} planar, "
+                f"{(frozen_types == 2).sum().item()} linear "
+                f"(of {frozen_types.shape[0]} Gaussians)."
+            )
+
         # Reset Delaunay samples if needed
         reset_occupancy_labels_for_new_delaunay_sites = False
         if use_delaunay_downsampling:
@@ -306,14 +348,19 @@ def compute_mesh_regularization(
         # Compute Voronoi generators
         # Pass delaunay_xyz_idx which might be None (use all), or indices after opacity/downsampling
         #
-        # NOTE: when use_adaptive_pivot_sampling is on, the number of corners emitted per Gaussian
-        # depends on its current scale, which drifts every iteration. The cached delaunay_tets
-        # references vertices by index into whatever point layout was used at the last
-        # triangulation, so the corner/center keep_mask MUST stay fixed between two
-        # triangulations (delaunay_tets is None <=> a new triangulation is about to be computed
-        # below), even though Gaussian scale keeps changing. Only recompute the mask when we are
-        # also about to recompute delaunay_tets; otherwise reuse the cached mask.
-        need_fresh_keep_mask = delaunay_tets is None
+        # NOTE: with use_adaptive_pivot_sampling, the per-Gaussian type is FROZEN at the start of
+        # mesh regularization (mesh_state["frozen_gaussian_types"]), so the number of corners emitted
+        # per Gaussian (8/4/2 + center) is constant regardless of scale drift. The keep_mask can
+        # therefore be recomputed fresh every iteration -- its total point count stays consistent
+        # with the cached delaunay_tets (which only changes on a Delaunay resample, i.e. when
+        # delaunay_tets is set to None and a fresh triangulation is built below).
+        if config.get("use_adaptive_pivot_sampling", False) and mesh_state["frozen_gaussian_types"] is not None:
+            override_gaussian_types = (
+                mesh_state["frozen_gaussian_types"] if delaunay_xyz_idx is None
+                else mesh_state["frozen_gaussian_types"][delaunay_xyz_idx]
+            )
+        else:
+            override_gaussian_types = None
         voronoi_points, voronoi_scale, voronoi_keep_mask = gaussians.get_tetra_points(
             downsample_ratio=None,
             let_gradients_flow=True,
@@ -321,10 +368,8 @@ def compute_mesh_regularization(
             use_adaptive_pivot_sampling=config.get("use_adaptive_pivot_sampling", False),
             gaussian_type_linear_ratio=config.get("gaussian_type_linear_ratio", 3.0),
             gaussian_type_planar_ratio=config.get("gaussian_type_planar_ratio", 3.0),
-            override_keep_mask=None if need_fresh_keep_mask else mesh_state["voronoi_keep_mask"],
+            override_gaussian_types=override_gaussian_types,
         )
-        if config.get("use_adaptive_pivot_sampling", False):
-            mesh_state["voronoi_keep_mask"] = voronoi_keep_mask
         voronoi_points_count = voronoi_points.shape[0]
         # Recompute Delaunay tetrahedralization if needed
         if delaunay_tets is None:
@@ -507,15 +552,10 @@ def compute_mesh_regularization(
                 (iteration % config["reset_occupancy_labels_every"] == 0)  # Every N iterations
                 or (iteration == config["start_iter"])  # First iteration
                 or reset_occupancy_labels_for_new_delaunay_sites  # If not fixing sites and downsampling, compute labels for sampled sites
-                # With use_adaptive_pivot_sampling, the per-Gaussian corner/center layout can change
-                # whenever the keep_mask is refreshed (every delaunay_reset_interval iterations), which is
-                # not necessarily in phase with reset_occupancy_labels_every. Two Gaussians can flip
-                # classification in opposite directions and leave the TOTAL point count unchanged while
-                # completely reshuffling which point maps to which cached label, so a size check alone is
-                # not enough: force a refresh in lockstep with every keep_mask/topology refresh.
-                or (need_fresh_keep_mask and config.get("use_adaptive_pivot_sampling", False))
-                # Defensive fallback: also force a refresh if the cached labels' size no longer matches the
-                # current point count, in case of any other desync.
+                # With use_adaptive_pivot_sampling the per-Gaussian type is frozen, so the keep_mask
+                # layout no longer reshuffles between iterations; labels only need refreshing on their
+                # normal schedule and on a Delaunay resample (both covered above). We still keep a
+                # defensive size check below in case of any other desync.
                 or (voronoi_occupancy_labels is not None and voronoi_occupancy_labels.shape[0] != voronoi_points.shape[0])
             )
         ):
@@ -621,12 +661,30 @@ def compute_mesh_regularization(
         else:
             occupancy_labels_loss = torch.zeros(size=(), device=gaussians._xyz.device)
 
+    # Type shape regularization: push each Gaussian toward its frozen type (linear -> more
+    # needle-like, planar -> flatter). Grad-enabled full-set scale; zero for volumetric Gaussians
+    # and when disabled / before types are frozen.
+    if (
+        config.get("use_type_shape_regularization", False)
+        and mesh_state["frozen_gaussian_types"] is not None
+    ):
+        log_scale_all = torch.log(gaussians.get_scaling.clamp(min=1e-12))
+        shape_reg_loss = config.get("shape_reg_weight", 0.01) * compute_type_shape_regularization(
+            log_scale_all,
+            mesh_state["frozen_gaussian_types"],
+            linear_target_ratio=config.get("shape_reg_linear_target_ratio", 5.0),
+            planar_target_ratio=config.get("shape_reg_planar_target_ratio", 5.0),
+        )
+    else:
+        shape_reg_loss = torch.zeros(size=(), device=gaussians._xyz.device)
+
     # --- Return Results ---
     total_mesh_loss = (
-        mesh_depth_loss 
-        + mesh_normal_loss 
-        + occupied_centers_loss 
+        mesh_depth_loss
+        + mesh_normal_loss
+        + occupied_centers_loss
         + occupancy_labels_loss
+        + shape_reg_loss
     )
     
     # --- Update State ---
@@ -646,6 +704,7 @@ def compute_mesh_regularization(
         "mesh_normal_loss": mesh_normal_loss.detach(),
         "occupied_centers_loss": occupied_centers_loss.detach(),
         "occupancy_labels_loss": occupancy_labels_loss.detach(),
+        "shape_reg_loss": shape_reg_loss.detach(),
         "updated_state": mesh_state,
         "mesh_render_pkg": {
             "depth": mesh_depth,

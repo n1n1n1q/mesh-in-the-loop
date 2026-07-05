@@ -141,6 +141,7 @@ def compute_pivot_keep_mask(
     corner_signs:torch.Tensor,
     linear_ratio:float=3.0,
     planar_ratio:float=3.0,
+    gaussian_types:torch.Tensor=None,
 ) -> torch.Tensor:
     """Compute a per-Gaussian keep-mask selecting which of the 9 canonical pivot slots
     (8 bounding-box corners + 1 center, in that order) should be used as Delaunay sites.
@@ -169,6 +170,11 @@ def compute_pivot_keep_mask(
             Shape: (8, 3).
         linear_ratio (float, optional): See `classify_gaussian_types`. Defaults to 3.0.
         planar_ratio (float, optional): See `classify_gaussian_types`. Defaults to 3.0.
+        gaussian_types (torch.Tensor, optional): Precomputed per-Gaussian type codes of shape (N,)
+            (0=volumetric, 1=planar, 2=linear), e.g. a frozen classification. If provided, it is
+            used directly instead of reclassifying from the current scale (linear_ratio/planar_ratio
+            are then ignored); the per-axis ranking used to select corners is still derived from the
+            current log_scale. Defaults to None (classify from log_scale).
 
     Returns:
         torch.Tensor: Boolean keep-mask. Shape: (N, 9).
@@ -176,7 +182,10 @@ def compute_pivot_keep_mask(
     n_gaussians = log_scale.shape[0]
     device = log_scale.device
 
-    gaussian_type = classify_gaussian_types(log_scale, linear_ratio=linear_ratio, planar_ratio=planar_ratio)
+    if gaussian_types is not None:
+        gaussian_type = gaussian_types.to(device)
+    else:
+        gaussian_type = classify_gaussian_types(log_scale, linear_ratio=linear_ratio, planar_ratio=planar_ratio)
     # rank[:, 0] = index of the dominant (largest-scale) axis, rank[:, 2] = most-minor axis
     rank = torch.argsort(log_scale, dim=-1, descending=True)
 
@@ -200,6 +209,56 @@ def compute_pivot_keep_mask(
 
     keep_center = torch.ones(n_gaussians, 1, dtype=torch.bool, device=device)
     return torch.cat([keep_corners, keep_center], dim=1)
+
+def compute_type_shape_regularization(
+    log_scale:torch.Tensor,
+    gaussian_types:torch.Tensor,
+    linear_target_ratio:float=5.0,
+    planar_target_ratio:float=5.0,
+) -> torch.Tensor:
+    """Type-specific shape regularization pushing each Gaussian toward its (frozen) type.
+
+    Works on the same sorted log-scale gaps as `classify_gaussian_types` (l0 >= l1 >= l2):
+      gap_major = l0 - l1   (dominance of the largest axis over the second)
+      gap_minor = l1 - l2   (dominance of the second axis over the smallest)
+    Both targets are one-sided hinges in log-space, so a Gaussian already "anisotropic enough"
+    (gap >= log(target_ratio)) contributes exactly zero and is never pushed further -- the loss
+    only sharpens under-shaped Gaussians up to the target ratio, bounding scale drift.
+
+      - Linear (type 2): penalize relu(log(linear_target_ratio) - gap_major). The gradient grows
+        the largest log-scale (one axis dominates further, "one eigenvalue bigger") and shrinks
+        the second-largest -> more needle-like.
+      - Planar (type 1): penalize relu(log(planar_target_ratio) - gap_minor). The gradient shrinks
+        the smallest log-scale ("minimum eigenvalue smaller") and slightly grows the second
+        -> more disk-like.
+      - Volumetric (type 0): no regularization.
+
+    Args:
+        log_scale (torch.Tensor): Log-space scale of the Gaussians (grad-enabled). Shape: (N, 3).
+        gaussian_types (torch.Tensor): Per-Gaussian frozen type codes. Shape: (N,).
+            0=volumetric, 1=planar, 2=linear.
+        linear_target_ratio (float, optional): Target l0/l1 ratio for linear Gaussians. Defaults to 5.0.
+        planar_target_ratio (float, optional): Target l1/l2 ratio for planar Gaussians. Defaults to 5.0.
+
+    Returns:
+        torch.Tensor: Scalar regularization loss (mean over each populated type, summed across types).
+    """
+    sorted_log_scale = torch.sort(log_scale, dim=-1, descending=True)[0]
+    gap_major = sorted_log_scale[:, 0] - sorted_log_scale[:, 1]
+    gap_minor = sorted_log_scale[:, 1] - sorted_log_scale[:, 2]
+
+    gaussian_types = gaussian_types.to(log_scale.device)
+    is_linear = gaussian_types == 2
+    is_planar = gaussian_types == 1
+
+    loss = log_scale.new_zeros(())
+    if is_linear.any():
+        eps_linear = math.log(linear_target_ratio)
+        loss = loss + (eps_linear - gap_major[is_linear]).clamp(min=0.).mean()
+    if is_planar.any():
+        eps_planar = math.log(planar_target_ratio)
+        loss = loss + (eps_planar - gap_minor[is_planar]).clamp(min=0.).mean()
+    return loss
 
 def build_scaling_rotation(s, r):
     L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device="cuda")
