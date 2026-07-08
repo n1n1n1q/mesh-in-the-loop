@@ -8,7 +8,10 @@ from os import makedirs
 import random
 from tqdm import tqdm
 from argparse import ArgumentParser
+import yaml
 from arguments import ModelParams, PipelineParams, get_combined_args
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 from gaussian_renderer import GaussianModel, render_simp
 import numpy as np
 import trimesh
@@ -32,7 +35,9 @@ def marching_tetrahedra_with_binary_search(
     n_binary_steps=8,
     isosurface_value=0.5,
     trunc_margin=None,
-):    
+    mesh_config=None,
+):
+    mesh_config = mesh_config or {}
     # Sample a subset of Gaussians for generating Gaussian pivots
     n_nonzero = (gaussians._base_occupancy != 0.).any(dim=-1).sum().item() if gaussians.learn_occupancy else 0
     
@@ -61,8 +66,17 @@ def marching_tetrahedra_with_binary_search(
             delaunay_xyz_idx = None
             print(f"[INFO] Using all {n_gaussians_to_sample_from} Gaussians for generating pivots.")
                 
-    # Generate Gaussian pivots
-    points, points_scale, _ = gaussians.get_tetra_points(xyz_idx=delaunay_xyz_idx)
+    # Generate Gaussian pivots (thread the adaptive / axis-adaptive pivot config so the integration
+    # mesh uses the same pivot layout the model was trained with; extraction live-classifies types).
+    points, points_scale, _ = gaussians.get_tetra_points(
+        xyz_idx=delaunay_xyz_idx,
+        use_adaptive_pivot_sampling=mesh_config.get("use_adaptive_pivot_sampling", False),
+        gaussian_type_linear_ratio=mesh_config.get("gaussian_type_linear_ratio", 3.0),
+        gaussian_type_planar_ratio=mesh_config.get("gaussian_type_planar_ratio", 3.0),
+        use_axis_adaptive_pivot_sampling=mesh_config.get("use_axis_adaptive_pivot_sampling", False),
+        linear_pivot_count=mesh_config.get("linear_pivot_count", 8),
+        planar_pivot_count=mesh_config.get("planar_pivot_count", 9),
+    )
     print(f"[INFO] Extracted {points.shape[0]} Delaunay sites from Gaussians.")
     t0 = time.time()
     
@@ -155,9 +169,10 @@ def marching_tetrahedra_with_binary_search(
     
 def extract_mesh(
     dataset : ModelParams, iteration : int, pipeline : PipelineParams, 
-    n_delaunay_sites=None, mtet_on_cpu=False, 
-    sdf_mode="integration", n_binary_steps=8, 
+    n_delaunay_sites=None, mtet_on_cpu=False,
+    sdf_mode="integration", n_binary_steps=8,
     isosurface_value=0.5, trunc_margin=None,
+    mesh_config=None,
 ):
     with torch.no_grad():
         # Load scene and Gaussian model
@@ -199,6 +214,7 @@ def extract_mesh(
             n_binary_steps=n_binary_steps,
             isosurface_value=isosurface_value,
             trunc_margin=trunc_margin,
+            mesh_config=mesh_config,
         )
 
 if __name__ == "__main__":
@@ -222,9 +238,18 @@ if __name__ == "__main__":
                         help="Max number of pivots to use for Delaunay triangulation.")
     parser.add_argument("--imp_metric", default='none', type=str)
     parser.add_argument("--warn_until_iter", default=3000, type=int)
+    parser.add_argument("--config", default='default', type=str,
+                        help="mesh config yaml (in configs/mesh/) providing the pivot-sampling flags.")
 
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
+
+    # Load the mesh regularization config so the integration extractor uses the same pivot layout
+    # (adaptive / axis-adaptive) the model was trained with.
+    mesh_config_file = os.path.join(BASE_DIR, "configs", "mesh", f"{args.config}.yaml")
+    with open(mesh_config_file, "r") as f:
+        mesh_config = yaml.safe_load(f)
+    print(f"[INFO] Loaded mesh config '{args.config}' for pivot sampling.")
     
     random.seed(0)
     np.random.seed(0)
@@ -270,5 +295,6 @@ if __name__ == "__main__":
         n_binary_steps=args.n_binary_steps,
         isosurface_value=args.isosurface_value,
         trunc_margin=args.trunc_margin,
+        mesh_config=mesh_config,
     )
     

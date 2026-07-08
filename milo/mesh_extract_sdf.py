@@ -116,6 +116,9 @@ def extract_mesh_with_sdf_refinement(
             use_adaptive_pivot_sampling=mesh_config.get("use_adaptive_pivot_sampling", False),
             gaussian_type_linear_ratio=mesh_config.get("gaussian_type_linear_ratio", 3.0),
             gaussian_type_planar_ratio=mesh_config.get("gaussian_type_planar_ratio", 3.0),
+            use_axis_adaptive_pivot_sampling=mesh_config.get("use_axis_adaptive_pivot_sampling", False),
+            linear_pivot_count=mesh_config.get("linear_pivot_count", 8),
+            planar_pivot_count=mesh_config.get("planar_pivot_count", 9),
         )
                 
     # Compute Delaunay triangulation

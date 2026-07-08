@@ -23,7 +23,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.appearance_network import AppearanceNetwork
 from utils.sh_utils import SH2RGB
-from utils.general_utils import compute_pivot_keep_mask
+from utils.general_utils import compute_pivot_keep_mask, compute_axis_adaptive_pivots
 import trimesh
 
 try:
@@ -422,6 +422,10 @@ class GaussianModel:
         gaussian_type_linear_ratio:float=3.0,
         gaussian_type_planar_ratio:float=3.0,
         override_gaussian_types:torch.Tensor=None,
+        use_axis_adaptive_pivot_sampling:bool=False,
+        linear_pivot_count:int=8,
+        planar_pivot_count:int=9,
+        override_axis_rank:torch.Tensor=None,
     ):
         """
         Get the tetra points of the Gaussian model.
@@ -457,6 +461,21 @@ class GaussianModel:
                 triangulation without needing to freeze the whole mask. The per-axis ranking used to pick
                 corners is still derived from the current scale. Only used if use_adaptive_pivot_sampling is
                 True. Defaults to None (classify from the current scale).
+            use_axis_adaptive_pivot_sampling (bool, optional): If True (requires
+                use_adaptive_pivot_sampling), reallocate the <=9-slot pivot budget to the axes with
+                extent instead of masking box corners: linear Gaussians get a string of stations
+                along their dominant axis, planar ones an in-plane grid, volumetric ones the full box
+                (see utils.general_utils.compute_axis_adaptive_pivots). Denser sampling of thin/flat
+                primitives closes Delaunay/Marching-Tetrahedra holes. Defaults to False.
+            linear_pivot_count (int, optional): Total pivots (stations + center) for a linear
+                Gaussian when axis-adaptive sampling is on, in [2, 9]. Defaults to 8.
+            planar_pivot_count (int, optional): Total pivots (stations + center) for a planar
+                Gaussian when axis-adaptive sampling is on, in [2, 9]. Defaults to 9.
+            override_axis_rank (torch.Tensor, optional): Precomputed per-Gaussian axis ranking
+                (n_gaussians, 3), axis_rank[:, 0] being the dominant raw axis. Freezing this
+                alongside override_gaussian_types keeps each axis-adaptive station's position stable
+                as the scale drifts. Only used with use_axis_adaptive_pivot_sampling. Defaults to
+                None (rank from the current scale).
         Raises:
             ValueError: If SDF values are not used but return_sdf_values is True.
 
@@ -532,7 +551,33 @@ class GaussianModel:
             if verbose:
                 print(f"[INFO] Number of tetra points after downsampling: {xyz.shape[0] * 9}.")
         
-        if use_adaptive_pivot_sampling:
+        if use_adaptive_pivot_sampling and use_axis_adaptive_pivot_sampling:
+            # Axis-adaptive: reallocate the <=9-slot budget to axes with extent (stations along the
+            # dominant axis for linear, in-plane grid for planar, full box for volumetric), rather
+            # than masking a subset of the fixed box corners. Offsets come back in the raw eigen-frame
+            # and are scaled / rotated / translated exactly like the box corners below.
+            log_scale = torch.log(scale.clamp(min=1e-12))
+            corner_signs = torch.from_numpy(M.vertices).float().to(xyz.device)
+            offsets, keep_mask = compute_axis_adaptive_pivots(
+                log_scale, corner_signs,
+                gaussian_types=override_gaussian_types,
+                axis_rank=override_axis_rank,
+                linear_ratio=gaussian_type_linear_ratio,
+                planar_ratio=gaussian_type_planar_ratio,
+                linear_pivot_count=linear_pivot_count,
+                planar_pivot_count=planar_pivot_count,
+            )  # offsets (N, 9, 3) raw-frame unit offsets, keep_mask (N, 9)
+
+            points_full = offsets * scale.unsqueeze(1)                  # (N, 9, 3): per-raw-axis scale
+            points_full = torch.bmm(points_full, rots.transpose(1, 2))  # rotate: (R x^T)^T = x R^T
+            points_full = points_full + xyz.unsqueeze(1)                # translate; slot 8 offset=0 -> center
+
+            scale_max = scale.max(dim=-1, keepdim=True)[0]  # (N, 1)
+            scale_full = scale_max.unsqueeze(1).expand(-1, 9, -1)  # (N, 9, 1)
+
+            vertices = points_full[keep_mask].contiguous()
+            vertices_scale = scale_full[keep_mask].contiguous()
+        elif use_adaptive_pivot_sampling:
             log_scale = torch.log(scale.clamp(min=1e-12))
             corner_signs = torch.from_numpy(M.vertices).float().to(xyz.device)
             keep_mask = compute_pivot_keep_mask(

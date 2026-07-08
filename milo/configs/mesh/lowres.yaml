@@ -23,6 +23,9 @@ collapse_large_edges: false  # true or false?
 use_adaptive_pivot_sampling: false   # type-adaptive corner-pivot count (9/5/3 for volumetric/planar/linear)
 gaussian_type_linear_ratio: 3.0      # log-scale gap threshold (as a ratio) for "linear" classification
 gaussian_type_planar_ratio: 3.0      # log-scale gap threshold (as a ratio) for "planar" classification
+use_axis_adaptive_pivot_sampling: false  # reallocate the pivot budget to axes with extent (stations along dominant axis / in-plane grid) instead of masking box corners
+linear_pivot_count: 8   # total pivots (stations + center) for a linear Gaussian, in [2, 9]
+planar_pivot_count: 9   # total pivots (stations + center) for a planar Gaussian, in [2, 9]
 use_type_shape_regularization: false  # freeze types at start_iter, then regularize shape per Gaussian type
 shape_reg_weight: 0.01
 shape_reg_linear_target_ratio: 5.0    # target l0/l1 ratio pushed for linear Gaussians

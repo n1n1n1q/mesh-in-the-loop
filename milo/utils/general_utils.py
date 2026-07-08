@@ -210,6 +210,146 @@ def compute_pivot_keep_mask(
     keep_center = torch.ones(n_gaussians, 1, dtype=torch.bool, device=device)
     return torch.cat([keep_corners, keep_center], dim=1)
 
+def _build_ranked_pivot_templates(
+    corner_signs:torch.Tensor,
+    linear_pivot_count:int,
+    planar_pivot_count:int,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Build the per-type pivot *station* templates, expressed in the ranked eigen-frame
+    [dominant, mid, minor] as unit multipliers of the per-axis (3-sigma) scale.
+
+    Unlike the corner keep-mask (which only ever selects a subset of the 8 fixed bounding-box
+    corners), the axis-adaptive scheme reallocates the (<=9)-slot budget to the axes that actually
+    have extent -- stringing stations *along* the dominant axis for linear Gaussians and spreading
+    them *in-plane* for planar ones -- so thin/flat primitives are sampled densely enough to close
+    Delaunay/Marching-Tetrahedra holes. Slots 0..7 hold the type-specific stations, slot 8 is always
+    the center (0,0,0). Collapsed axes never fully collapse: every station keeps a +-1 offset on the
+    collapsed axis (tiny in world space since the collapsed scale is small) with an *alternating*
+    sign along the string / grid, so the kept points stay non-collinear (linear) and non-coplanar
+    (planar) -- the same anti-sliver reasoning as the symmetric corner selection.
+
+    Args:
+        corner_signs (torch.Tensor): The 8 box-corner sign patterns (values in {-1, 1}), shape (8, 3).
+            Used verbatim for the volumetric template (so volumetric Gaussians keep the full box).
+        linear_pivot_count (int): Total pivots for a linear Gaussian (stations + center), in [2, 9].
+        planar_pivot_count (int): Total pivots for a planar Gaussian (stations + center), in [2, 9].
+
+    Returns:
+        templates (torch.Tensor): (3, 9, 3) ranked-frame offsets, indexed by type code
+            (0=volumetric, 1=planar, 2=linear). Slot 8 is the center for every type.
+        keep_masks (torch.Tensor): (3, 9) bool, which of the 9 slots are active per type.
+    """
+    device = corner_signs.device
+    linear_pivot_count = int(max(2, min(9, linear_pivot_count)))
+    planar_pivot_count = int(max(2, min(9, planar_pivot_count)))
+
+    templates = torch.zeros(3, 9, 3, dtype=torch.float32, device=device)
+    keep_masks = torch.zeros(3, 9, dtype=torch.bool, device=device)
+
+    # --- Volumetric (type 0): the full box, unchanged. 8 corners + center. ---
+    templates[0, :8, :] = corner_signs.to(device).float()
+    templates[0, 8, :] = 0.0
+    keep_masks[0, :] = True
+
+    # --- Planar (type 1): grid in the (dominant, mid) plane, +-1 checkerboard on the minor axis. ---
+    n_planar_stations = planar_pivot_count - 1
+    grid = [(d, m) for d in (-1.0, 0.0, 1.0) for m in (-1.0, 0.0, 1.0) if not (d == 0.0 and m == 0.0)]
+    for i, (d, m) in enumerate(grid[:n_planar_stations]):
+        n_sign = 1.0 if (int(round(d)) + int(round(m))) % 2 == 0 else -1.0
+        templates[1, i, :] = torch.tensor([d, m, n_sign], device=device)
+        keep_masks[1, i] = True
+    keep_masks[1, 8] = True  # center
+
+    # --- Linear (type 2): string of stations along the dominant axis, alternating +-1 on the two
+    #     collapsed (mid, minor) axes so the string is not perfectly collinear. ---
+    n_linear_stations = linear_pivot_count - 1
+    if n_linear_stations == 1:
+        d_positions = [0.0]
+    else:
+        d_positions = [(-1.0 + 2.0 * i / (n_linear_stations - 1)) for i in range(n_linear_stations)]
+    for i, d in enumerate(d_positions):
+        m_sign = 1.0 if i % 2 == 0 else -1.0
+        n_sign = 1.0 if (i // 2) % 2 == 0 else -1.0
+        templates[2, i, :] = torch.tensor([d, m_sign, n_sign], device=device)
+        keep_masks[2, i] = True
+    keep_masks[2, 8] = True  # center
+
+    return templates, keep_masks
+
+def compute_axis_adaptive_pivots(
+    log_scale:torch.Tensor,
+    corner_signs:torch.Tensor,
+    gaussian_types:torch.Tensor=None,
+    axis_rank:torch.Tensor=None,
+    linear_ratio:float=3.0,
+    planar_ratio:float=3.0,
+    linear_pivot_count:int=8,
+    planar_pivot_count:int=9,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Compute per-Gaussian axis-adaptive pivot offsets and their keep-mask.
+
+    The <=9-slot budget is reallocated to the axes with extent: linear Gaussians get a string of
+    stations along their dominant axis, planar ones an in-plane grid, volumetric ones the full box
+    (see `_build_ranked_pivot_templates`). Offsets are built in the ranked eigen-frame and scattered
+    back to the raw (x, y, z) eigen-axes using the per-Gaussian axis ranking, so downstream they are
+    scaled by the raw per-axis scale, rotated by the Gaussian rotation and translated by its center
+    exactly like the box corners.
+
+    The per-Gaussian pivot *count* depends only on the (frozen) type, so it stays constant as the
+    scale drifts -- preserving the invariant that keeps the emitted point count consistent with a
+    cached Delaunay triangulation (same property the frozen-type keep-mask relies on).
+
+    Args:
+        log_scale (torch.Tensor): Log-space per-axis scale, shape (N, 3). Used to derive the axis
+            ranking (and, if gaussian_types is None, the classification).
+        corner_signs (torch.Tensor): The 8 box-corner sign patterns, shape (8, 3).
+        gaussian_types (torch.Tensor, optional): Precomputed per-Gaussian type codes (N,)
+            (0=volumetric, 1=planar, 2=linear), e.g. frozen at the start of mesh regularization.
+            If None, classify from log_scale using linear_ratio/planar_ratio.
+        axis_rank (torch.Tensor, optional): Precomputed per-Gaussian axis ranking (N, 3), where
+            axis_rank[:, 0] is the index of the dominant (largest-scale) raw axis. Freezing this
+            alongside the types keeps each slot's position stable as the scale evolves. If None,
+            derive it from the current log_scale.
+        linear_ratio (float, optional): See `classify_gaussian_types`. Defaults to 3.0.
+        planar_ratio (float, optional): See `classify_gaussian_types`. Defaults to 3.0.
+        linear_pivot_count (int, optional): Total pivots for a linear Gaussian (in [2, 9]). Defaults to 8.
+        planar_pivot_count (int, optional): Total pivots for a planar Gaussian (in [2, 9]). Defaults to 9.
+
+    Returns:
+        offsets (torch.Tensor): (N, 9, 3) raw-frame unit offsets (multipliers of the per-axis scale);
+            slot 8 is the center (0, 0, 0).
+        keep_mask (torch.Tensor): (N, 9) bool, which of the 9 slots are active per Gaussian.
+    """
+    n_gaussians = log_scale.shape[0]
+    device = log_scale.device
+
+    if gaussian_types is None:
+        gaussian_types = classify_gaussian_types(log_scale, linear_ratio=linear_ratio, planar_ratio=planar_ratio)
+    gaussian_types = gaussian_types.to(device).long()
+
+    if axis_rank is None:
+        axis_rank = torch.argsort(log_scale, dim=-1, descending=True)
+    axis_rank = axis_rank.to(device).long()
+
+    templates, keep_masks = _build_ranked_pivot_templates(
+        corner_signs, linear_pivot_count, planar_pivot_count,
+    )
+    templates = templates.to(device)
+    keep_masks = keep_masks.to(device)
+
+    # Select the ranked-frame template + keep-mask for each Gaussian by its type.
+    ranked = templates[gaussian_types]        # (N, 9, 3), columns = [dominant, mid, minor]
+    keep_mask = keep_masks[gaussian_types]     # (N, 9)
+
+    # Scatter each ranked-axis column onto the raw axis it corresponds to:
+    #   offsets[n, s, axis_rank[n, c]] = ranked[n, s, c]
+    # so the dominant-axis station coordinate lands on the raw axis that is actually dominant.
+    idx = axis_rank.unsqueeze(1).expand(n_gaussians, 9, 3)
+    offsets = torch.zeros(n_gaussians, 9, 3, dtype=ranked.dtype, device=device)
+    offsets.scatter_(2, idx, ranked)
+
+    return offsets, keep_mask
+
 def compute_type_shape_regularization(
     log_scale:torch.Tensor,
     gaussian_types:torch.Tensor,

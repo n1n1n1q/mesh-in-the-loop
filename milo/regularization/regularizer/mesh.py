@@ -97,6 +97,9 @@ def initialize_mesh_regularization(
         # Per-Gaussian type codes (0=volumetric, 1=planar, 2=linear) frozen once at the start of
         # mesh regularization. Drives both the adaptive pivot keep-mask and the type shape reg.
         "frozen_gaussian_types": None,
+        # Per-Gaussian axis ranking (N, 3; column 0 = dominant raw axis) frozen alongside the types.
+        # Used by axis-adaptive pivot sampling to keep each station's position stable as scale drifts.
+        "frozen_axis_rank": None,
     }
 
     return mesh_renderer, mesh_state
@@ -253,7 +256,11 @@ def compute_mesh_regularization(
                     linear_ratio=config.get("gaussian_type_linear_ratio", 3.0),
                     planar_ratio=config.get("gaussian_type_planar_ratio", 3.0),
                 )
+                # Freeze the axis ranking too, so axis-adaptive station positions stay stable as the
+                # scale drifts (a rank flip would otherwise discontinuously reorient the stations).
+                frozen_axis_rank = torch.argsort(log_scale_all, dim=-1, descending=True)
             mesh_state["frozen_gaussian_types"] = frozen_types
+            mesh_state["frozen_axis_rank"] = frozen_axis_rank
             print(
                 f"[INFO] Froze Gaussian types at iteration {iteration}: "
                 f"{(frozen_types == 0).sum().item()} volumetric, "
@@ -359,8 +366,13 @@ def compute_mesh_regularization(
                 mesh_state["frozen_gaussian_types"] if delaunay_xyz_idx is None
                 else mesh_state["frozen_gaussian_types"][delaunay_xyz_idx]
             )
+            override_axis_rank = (
+                mesh_state["frozen_axis_rank"] if delaunay_xyz_idx is None
+                else mesh_state["frozen_axis_rank"][delaunay_xyz_idx]
+            )
         else:
             override_gaussian_types = None
+            override_axis_rank = None
         voronoi_points, voronoi_scale, voronoi_keep_mask = gaussians.get_tetra_points(
             downsample_ratio=None,
             let_gradients_flow=True,
@@ -369,6 +381,10 @@ def compute_mesh_regularization(
             gaussian_type_linear_ratio=config.get("gaussian_type_linear_ratio", 3.0),
             gaussian_type_planar_ratio=config.get("gaussian_type_planar_ratio", 3.0),
             override_gaussian_types=override_gaussian_types,
+            use_axis_adaptive_pivot_sampling=config.get("use_axis_adaptive_pivot_sampling", False),
+            linear_pivot_count=config.get("linear_pivot_count", 8),
+            planar_pivot_count=config.get("planar_pivot_count", 9),
+            override_axis_rank=override_axis_rank,
         )
         voronoi_points_count = voronoi_points.shape[0]
         # Recompute Delaunay tetrahedralization if needed
