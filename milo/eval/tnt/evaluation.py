@@ -69,6 +69,7 @@ def EvaluateHisto(
     scene_name,
     view_crop,
     verbose=True,
+    gt_already_cropped=False,
 ):
     print("[EvaluateHisto]")
     o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Debug)
@@ -85,9 +86,9 @@ def EvaluateHisto(
     print(filename_mvs + "/" + scene_name + ".precision.ply")
 
     t = copy.deepcopy(target)
-    if crop_volume is not None:
+    if not gt_already_cropped and crop_volume is not None:
         t = crop_volume.crop_point_cloud(t)
-    else:
+    elif crop_volume is None and not gt_already_cropped:
         print("No bounding box provided to crop groundtruth point cloud, leaving it as the loaded version!!")
 
     t = t.voxel_down_sample(voxel_size)
