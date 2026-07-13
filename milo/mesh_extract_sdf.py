@@ -557,6 +557,12 @@ if __name__ == "__main__":
     # For delaunay downsampling
     parser.add_argument("--warn_until_iter", default=3000, type=int)
     parser.add_argument("--imp_metric", default='none', type=str)
+    # Z-curve stratified importance sampling: importance exponent within each stratum.
+    # 1.0 = importance-weighted, 0.0 = uniform (pure spatial). Negative = legacy sampling.
+    parser.add_argument("--zcurve_alpha", default=1.0, type=float)
+    # Selection rule for Delaunay site downsampling (only fires if the site budget binds).
+    parser.add_argument("--prune_rule", type=str, default=None,
+                        choices=["legacy", "zcurve", "density", "density_only"])
     # Config file
     parser.add_argument("--config", default='default', type=str)
     # For refinement

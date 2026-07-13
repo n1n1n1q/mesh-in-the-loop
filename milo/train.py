@@ -562,7 +562,15 @@ if __name__ == "__main__":
     parser.add_argument("--simp_iteration1", type=int, default = 3_000)
     parser.add_argument("--simp_iteration2", type=int, default = 8_000)
     parser.add_argument("--sampling_factor", type=float, default = 0.6)
-    
+    # Z-curve stratified importance sampling: importance exponent within each stratum.
+    # 1.0 = importance-weighted, 0.0 = uniform (pure spatial). Negative = legacy sampling.
+    parser.add_argument("--zcurve_alpha", type=float, default = 1.0)
+    # Selection rule for the simplification steps. Overrides the zcurve_alpha convention:
+    # "density" = top-k imp/distCUDA2 (see context/zcurve_geometry_aware_ideas.md).
+    parser.add_argument("--prune_rule", type=str, default=None,
+                        choices=["legacy", "zcurve", "density", "density_only"])
+    parser.add_argument("--dump_prune_signals", action="store_true")
+
     # ----- Depth-Normal consistency Regularization -----
     # > Inspired by 2DGS, GOF, RaDe-GS...
     parser.add_argument("--regularization_from_iter", type=int, default = 3_000)

@@ -31,6 +31,43 @@ except:
     pass
 from torch.optim import Adam
 
+def _zcurve_alpha(args):
+    """Importance exponent for Z-curve stratified sampling. Negative disables it."""
+    return getattr(args, "zcurve_alpha", 1.0) if args is not None else 1.0
+
+
+def _prune_rule(args):
+    """
+    Which selection rule the simplification/sampling steps use:
+      "legacy"  - original MiniSplatting np.random.choice / init_cdf_mask
+      "zcurve"  - Morton stratified importance sampling (exponent = zcurve_alpha)
+      "density" - top-k of imp_score / distCUDA2(xyz)  (density-boosted importance)
+    If --prune_rule is not given, falls back to the zcurve_alpha convention used by the
+    z-curve ablation: alpha >= 0 -> "zcurve", alpha < 0 -> "legacy".
+    """
+    rule = getattr(args, "prune_rule", None) if args is not None else None
+    if rule:
+        return rule
+    return "zcurve" if _zcurve_alpha(args) >= 0. else "legacy"
+
+
+def _maybe_dump_prune_signals(gaussians, iteration, args, imp_score, count_vis, num_sampled):
+    """Save the pre-prune population + signals so selection rules can be benched offline."""
+    if not getattr(args, "dump_prune_signals", False):
+        return
+    path = os.path.join(args.model_path, f"prune_signals_iter{iteration}.npz")
+    np.savez_compressed(
+        path,
+        xyz=gaussians._xyz.detach().cpu().numpy().astype(np.float32),
+        imp_score=imp_score.detach().cpu().numpy().astype(np.float32),
+        count_vis=count_vis[:, 0].detach().cpu().numpy().astype(np.float32),
+        scales=gaussians.get_scaling.detach().cpu().numpy().astype(np.float16),
+        opacity=gaussians.get_opacity.detach().cpu().numpy().astype(np.float16),
+        num_sampled=np.int64(num_sampled),
+    )
+    print(f"[INFO] Dumped prune signals to {path}")
+
+
 def init_cdf_mask(importance, thres=1.0):
     importance = importance.flatten()   
     if thres!=1.0:
@@ -1067,6 +1104,45 @@ class GaussianModel:
 
 
 
+    @torch.no_grad()
+    def zcurve_sample(self, imp_score, num_sampled, args):
+        """
+        Draw `num_sampled` Gaussian indices without replacement, spread evenly in space.
+
+        Gaussians are sorted along a Z-order (Morton) curve and split into `num_sampled`
+        equal-count strata; one is drawn per stratum with probability proportional to
+        `imp_score ** zcurve_alpha`. Gaussians with `imp_score == 0` are never drawn, so
+        callers must zero out anything they want excluded before calling.
+        """
+        # Local import: functional/__init__ -> sdf -> depth_fusion -> scene.gaussian_model.
+        from functional.func_utils import stratified_importance_sample
+        return stratified_importance_sample(
+            self._xyz.detach(), imp_score, num_sampled, alpha=_zcurve_alpha(args),
+        )
+
+    @torch.no_grad()
+    def density_topk_sample(self, imp_score, num_sampled, use_imp=True):
+        """
+        Density-boosted selection: top `num_sampled` by imp_score / distCUDA2(xyz)
+        (use_imp=True), or by pure 1/distCUDA2 among imp_score > 0 candidates
+        (use_imp=False). distCUDA2 is the mean squared distance to the 3 nearest
+        neighbours, so this is imp/knn^2 resp. 1/knn^2 — local density is a stronger,
+        scene-robust on-surface signal (AUC ~0.7 on Truck and Meetingroom) while
+        imp_score collapses below chance indoors (see
+        context/zcurve_geometry_aware_ideas.md). Gaussians with imp_score == 0 are
+        never selected under either variant.
+        """
+        imp = imp_score.reshape(-1).float()
+        d2 = distCUDA2(self._xyz.detach().float()).clamp_min(1e-12)
+        if use_imp:
+            w = imp / d2
+        else:
+            w = (imp > 0).float() / d2
+        k = min(int(num_sampled), int((w > 0).sum().item()))
+        if k <= 0:
+            return torch.zeros(0, dtype=torch.long, device=w.device)
+        return torch.topk(w, k).indices
+
     def depth_reinit(self, scene, render_depth, iteration, num_depth, args, pipe, background):
 
         out_pts_list=[]
@@ -1139,20 +1215,32 @@ class GaussianModel:
                 imp_score=imp_score+accum_weights
         
         imp_score[accum_area_max==0]=0
-        prob = imp_score/imp_score.sum()
-        prob = prob.cpu().numpy()
-
-
         factor=args.sampling_factor
         N_xyz=self._xyz.shape[0]
-        num_sampled=int(N_xyz*factor*((prob!=0).sum()/prob.shape[0]))
-        indices = np.random.choice(N_xyz, size=num_sampled, 
-                                    p=prob, replace=False)
+        rule = _prune_rule(args)
 
-        mask = np.zeros(N_xyz, dtype=bool)
-        mask[indices] = True
+        if rule == "legacy":
+            prob = imp_score/imp_score.sum()
+            prob = prob.cpu().numpy()
 
-        self.prune_points(mask==False)
+            num_sampled=int(N_xyz*factor*((prob!=0).sum()/prob.shape[0]))
+            indices = np.random.choice(N_xyz, size=num_sampled,
+                                        p=prob, replace=False)
+
+            mask = np.zeros(N_xyz, dtype=bool)
+            mask[indices] = True
+            keep_mask = torch.tensor(mask, device='cuda')
+        else:
+            num_sampled=int(N_xyz*factor*((imp_score!=0).sum().item()/N_xyz))
+            if rule.startswith("density"):
+                indices = self.density_topk_sample(imp_score, num_sampled,
+                                                   use_imp=(rule == "density"))
+            else:
+                indices = self.zcurve_sample(imp_score, num_sampled, args)
+            keep_mask = torch.zeros(N_xyz, dtype=torch.bool, device='cuda')
+            keep_mask[indices] = True
+
+        self.prune_points(keep_mask==False)
 
         return self._xyz, SH2RGB(self._features_dc+0)[:,0]
 
@@ -1379,14 +1467,36 @@ class GaussianModel:
 
 
         imp_score[accum_area_max==0]=0
-        non_prune_mask = init_cdf_mask(importance=imp_score, thres=0.99) 
-
         self.factor_culling=count_vis/(count_rad+1e-1)
+        rule = _prune_rule(args)
 
+        if getattr(args, "dump_prune_signals", False):
+            imp_fold = imp_score.clone()
+            imp_fold[(count_vis<=1)[:,0]] = 0
+            _maybe_dump_prune_signals(self, iteration, args, imp_score, count_vis,
+                                      int(init_cdf_mask(importance=imp_fold, thres=0.99).sum().item()))
 
-        prune_mask = (count_vis<=1)[:,0]
-        prune_mask = torch.logical_or(prune_mask, non_prune_mask==False)
-        self.prune_points(prune_mask) 
+        if rule == "legacy":
+            non_prune_mask = init_cdf_mask(importance=imp_score, thres=0.99)
+            prune_mask = (count_vis<=1)[:,0]
+            prune_mask = torch.logical_or(prune_mask, non_prune_mask==False)
+        else:
+            # The original keeps whatever clears a 99%-importance-mass threshold. We keep
+            # the same *budget* but pick the survivors by a different rule.
+            imp_score[(count_vis<=1)[:,0]]=0
+            num_sampled = int(init_cdf_mask(importance=imp_score, thres=0.99).sum().item())
+            if rule.startswith("density"):
+                indices = self.density_topk_sample(imp_score, num_sampled,
+                                                   use_imp=(rule == "density"))
+            else:
+                indices = self.zcurve_sample(imp_score, num_sampled, args)
+            N_xyz = self._xyz.shape[0]
+            print(f"[INFO] {rule} simp2: {num_sampled} budget -> {indices.shape[0]} kept of {N_xyz}.")
+
+            prune_mask = torch.ones(N_xyz, dtype=torch.bool, device='cuda')
+            prune_mask[indices] = False
+
+        self.prune_points(prune_mask)
 
 
     # interesction_sampling with visibility_culling
@@ -1425,24 +1535,46 @@ class GaussianModel:
 
 
         imp_score[accum_area_max==0]=0
-        prob = imp_score/imp_score.sum()
-        prob = prob.cpu().numpy()
-
-        factor=args.sampling_factor
-        N_xyz=self._xyz.shape[0]
-        num_sampled=int(N_xyz*factor*((prob!=0).sum()/prob.shape[0]))
-        indices = np.random.choice(N_xyz, size=num_sampled, 
-                                    p=prob, replace=False)
-
-        non_prune_mask = np.zeros(N_xyz, dtype=bool)
-        non_prune_mask[indices] = True
-
-
         self.factor_culling=count_vis/(count_rad+1e-1)
+        N_xyz=self._xyz.shape[0]
+        factor=args.sampling_factor
+        rule = _prune_rule(args)
 
-        prune_mask = (count_vis<=1)[:,0]
-        prune_mask = torch.logical_or(prune_mask, torch.tensor(non_prune_mask==False, device='cuda'))
-        self.prune_points(prune_mask) 
+        if getattr(args, "dump_prune_signals", False):
+            nnz_folded = ((imp_score != 0) & (count_vis[:, 0] > 1)).sum().item()
+            _maybe_dump_prune_signals(self, iteration, args, imp_score, count_vis,
+                                      int(N_xyz * factor * (nnz_folded / N_xyz)))
+
+        if rule == "legacy":
+            prob = imp_score/imp_score.sum()
+            prob = prob.cpu().numpy()
+
+            num_sampled=int(N_xyz*factor*((prob!=0).sum()/prob.shape[0]))
+            indices = np.random.choice(N_xyz, size=num_sampled,
+                                        p=prob, replace=False)
+
+            non_prune_mask = np.zeros(N_xyz, dtype=bool)
+            non_prune_mask[indices] = True
+
+            prune_mask = (count_vis<=1)[:,0]
+            prune_mask = torch.logical_or(prune_mask, torch.tensor(non_prune_mask==False, device='cuda'))
+        else:
+            # Fold the visibility filter in *before* sampling. The original sampled first
+            # and then dropped the low-visibility picks, silently wasting budget.
+            imp_score[(count_vis<=1)[:,0]]=0
+
+            num_sampled=int(N_xyz*factor*((imp_score!=0).sum().item()/N_xyz))
+            if rule.startswith("density"):
+                indices = self.density_topk_sample(imp_score, num_sampled,
+                                                   use_imp=(rule == "density"))
+            else:
+                indices = self.zcurve_sample(imp_score, num_sampled, args)
+            print(f"[INFO] {rule} simp1: {num_sampled} budget -> {indices.shape[0]} kept of {N_xyz}.")
+
+            prune_mask = torch.ones(N_xyz, dtype=torch.bool, device='cuda')
+            prune_mask[indices] = False
+
+        self.prune_points(prune_mask)
 
 
     # importance_pruning with visibility_culling
@@ -1521,28 +1653,38 @@ class GaussianModel:
         imp_score[accum_area_max==0]=0
         if sampling_mask is not None:
             imp_score[~sampling_mask] = 0.0
-        
-        prob = imp_score/imp_score.sum()
-        prob = prob.cpu().numpy()
 
         N_xyz=self._xyz.shape[0]
-        N_nonzero_prob = (prob !=0 ).sum()
-        
-        # factor=args.sampling_factor
-        # num_sampled=int(N_xyz*factor)
-        num_sampled = min(n_samples, N_nonzero_prob)
-        
-        indices = np.random.choice(N_xyz, size=num_sampled, p=prob, replace=False)
-
-        non_prune_mask = np.zeros(N_xyz, dtype=bool)
-        non_prune_mask[indices] = True
-
         self.factor_culling=count_vis/(count_rad+1e-1)
+        rule = _prune_rule(args)
 
-        # Non-sampled Gaussians
-        prune_mask = (count_vis<=1)[:,0]
-        prune_mask = torch.logical_or(prune_mask, torch.tensor(non_prune_mask==False, device='cuda'))
-        
+        if rule == "legacy":
+            prob = imp_score/imp_score.sum()
+            prob = prob.cpu().numpy()
+
+            N_nonzero_prob = (prob !=0 ).sum()
+            num_sampled = min(n_samples, N_nonzero_prob)
+
+            indices = np.random.choice(N_xyz, size=num_sampled, p=prob, replace=False)
+
+            non_prune_mask = np.zeros(N_xyz, dtype=bool)
+            non_prune_mask[indices] = True
+
+            # Non-sampled Gaussians
+            prune_mask = (count_vis<=1)[:,0]
+            prune_mask = torch.logical_or(prune_mask, torch.tensor(non_prune_mask==False, device='cuda'))
+        else:
+            # Fold the visibility filter in before sampling rather than discarding picks after.
+            imp_score[(count_vis<=1)[:,0]] = 0.0
+            if rule.startswith("density"):
+                indices = self.density_topk_sample(imp_score, n_samples,
+                                                   use_imp=(rule == "density"))
+            else:
+                indices = self.zcurve_sample(imp_score, n_samples, args)
+
+            prune_mask = torch.ones(N_xyz, dtype=torch.bool, device='cuda')
+            prune_mask[indices] = False
+
         # Sampled Gaussians
         sampled_idx = torch.arange(N_xyz, device='cuda')[~prune_mask]
         return sampled_idx
