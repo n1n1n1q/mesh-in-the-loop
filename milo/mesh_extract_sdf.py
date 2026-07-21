@@ -35,6 +35,8 @@ from utils.geometry_utils import (
 from scene.gaussian_model import SparseGaussianAdam
 
 from tetranerf.utils.extension import cpp
+from functional.delaunay import compute_triangulation
+from simple_knn._C import distCUDA2  # for the WDT `density` weight mode (imp_score / distCUDA2)
 import time
 
 import matplotlib.pyplot as plt
@@ -108,18 +110,48 @@ def extract_mesh_with_sdf_refinement(
             delaunay_xyz_idx = None
             print(f"[INFO] No need to downsample the {n_gaussians_to_sample_from} Delaunay Gaussians.")
 
-        voronoi_points, voronoi_scales = gaussians.get_tetra_points(
-            downsample_ratio=None,
-            let_gradients_flow=False,
-            xyz_idx=delaunay_xyz_idx, # Pass the computed indices
-            verbose=True
-        )
-                
-    # Compute Delaunay triangulation
+        # The `opacity`/`density` WDT weight modes need a pivot-aligned per-Gaussian feature.
+        wdt_mode = mesh_config.get("wdt_weight_mode") if mesh_config.get("use_weighted_triangulation", False) else None
+        voronoi_opacity = None
+        voronoi_density = None
+        if wdt_mode == "opacity":
+            voronoi_points, voronoi_scales, voronoi_opacity = gaussians.get_tetra_points(
+                downsample_ratio=None, let_gradients_flow=False,
+                xyz_idx=delaunay_xyz_idx, verbose=True, return_opacity=True,
+            )
+        elif wdt_mode == "density":
+            imp_score = gaussians.compute_importance_score(
+                scene, render_simp, iteration, args, pipe, background)
+            dist2 = torch.clamp_min(distCUDA2(gaussians.get_xyz.detach()), 1e-7)
+            density_score = imp_score / dist2
+            voronoi_points, voronoi_scales, voronoi_density = gaussians.get_tetra_points(
+                downsample_ratio=None, let_gradients_flow=False,
+                xyz_idx=delaunay_xyz_idx, verbose=True, extra_gaussian_feature=density_score,
+            )
+        else:
+            voronoi_points, voronoi_scales = gaussians.get_tetra_points(
+                downsample_ratio=None,
+                let_gradients_flow=False,
+                xyz_idx=delaunay_xyz_idx, # Pass the computed indices
+                verbose=True
+            )
+
+    # Compute triangulation (plain Delaunay, or weighted/regular when the config enables it).
+    # Must match the config used at training time so extraction sees the same connectivity.
     start_time = time.time()
-    delaunay_tets = cpp.triangulate(voronoi_points.detach()).cuda().long()
+    if mesh_config.get("use_weighted_triangulation", False):
+        delaunay_tets, n_hidden = compute_triangulation(
+            voronoi_points, config=mesh_config, pivot_scales=voronoi_scales,
+            return_num_hidden=True, pivot_opacity=voronoi_opacity,
+            pivot_density=voronoi_density,
+        )
+        print(f"[INFO] Weighted triangulation ({mesh_config.get('wdt_weight_mode')}, "
+              f"scale={mesh_config.get('wdt_weight_scale')}): {delaunay_tets.shape[0]} tets, "
+              f"{n_hidden} hidden pivots.")
+    else:
+        delaunay_tets = compute_triangulation(voronoi_points, config=mesh_config)
     end_time = time.time()
-    print(f"Delaunay triangulation time: {end_time - start_time} seconds")
+    print(f"Triangulation time: {end_time - start_time} seconds")
     
     # Get Mesh renderer
     mesh_rasterizer = MeshRasterizer(cameras=scene.getTrainCameras().copy())

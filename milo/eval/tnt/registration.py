@@ -119,7 +119,10 @@ def crop_and_downsample(
 ):
     pcd_copy = copy.deepcopy(pcd)
     pcd_copy.transform(trans)
-    pcd_crop = crop_volume.crop_point_cloud(pcd_copy)
+    if crop_volume is not None:
+        pcd_crop = crop_volume.crop_point_cloud(pcd_copy)
+    else:
+        pcd_crop = pcd_copy
     if down_sample_method == "voxel":
         # return voxel_down_sample(pcd_crop, voxel_size)
         return pcd_crop.voxel_down_sample(voxel_size)
@@ -140,6 +143,7 @@ def registration_unif(
     max_itr,
     max_size=4 * MAX_POINT_NUMBER,
     verbose=True,
+    gt_already_cropped=False,
 ):
     if verbose:
         print("[Registration] threshold: %f" % threshold)
@@ -149,7 +153,7 @@ def registration_unif(
                             down_sample_method="uniform",
                             trans=init_trans)
     t = crop_and_downsample(gt_target,
-                            crop_volume,
+                            None if gt_already_cropped else crop_volume,
                             down_sample_method="uniform")
     reg = o3d.pipelines.registration.registration_icp(
         s,
@@ -172,6 +176,7 @@ def registration_vol_ds(
     threshold,
     max_itr,
     verbose=True,
+    gt_already_cropped=False,
 ):
     if verbose:
         print("[Registration] voxel_size: %f, threshold: %f" %
@@ -186,7 +191,7 @@ def registration_vol_ds(
     )
     t = crop_and_downsample(
         gt_target,
-        crop_volume,
+        None if gt_already_cropped else crop_volume,
         down_sample_method="voxel",
         voxel_size=voxel_size,
     )

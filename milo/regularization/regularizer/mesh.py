@@ -37,6 +37,10 @@ except ImportError:
     cpp = None
     print("[WARNING] Could not import 'tetranerf.utils.extension.cpp'. Mesh regularization requires this.")
 
+# Config-gated triangulation dispatcher (plain Delaunay, or weighted/regular when enabled).
+from functional.delaunay import compute_triangulation
+from simple_knn._C import distCUDA2  # for the WDT `density` weight mode (imp_score / distCUDA2)
+
 
 def initialize_mesh_regularization(
     scene: Scene, 
@@ -304,18 +308,49 @@ def compute_mesh_regularization(
 
         # Compute Voronoi generators
         # Pass delaunay_xyz_idx which might be None (use all), or indices after opacity/downsampling
-        voronoi_points, voronoi_scale = gaussians.get_tetra_points(
-            downsample_ratio=None,
-            let_gradients_flow=True,
-            xyz_idx=delaunay_xyz_idx, # Pass the computed indices
-        )
+        # The `opacity`/`density` WDT weight modes additionally need a pivot-aligned per-Gaussian
+        # feature (opacity, or imp_score/distCUDA2) broadcast to pivots.
+        wdt_mode = config.get("wdt_weight_mode") if config.get("use_weighted_triangulation", False) else None
+        voronoi_opacity = None
+        voronoi_density = None
+        if wdt_mode == "opacity":
+            voronoi_points, voronoi_scale, voronoi_opacity = gaussians.get_tetra_points(
+                downsample_ratio=None, let_gradients_flow=True,
+                xyz_idx=delaunay_xyz_idx, return_opacity=True,
+            )
+        elif wdt_mode == "density":
+            # density signal = imp_score / distCUDA2 (the --prune_rule density signal)
+            imp_score = gaussians.compute_importance_score(
+                scene, render_simp, iteration, args, pipe, background)
+            dist2 = torch.clamp_min(distCUDA2(gaussians.get_xyz.detach()), 1e-7)
+            density_score = imp_score / dist2
+            voronoi_points, voronoi_scale, voronoi_density = gaussians.get_tetra_points(
+                downsample_ratio=None, let_gradients_flow=True,
+                xyz_idx=delaunay_xyz_idx, extra_gaussian_feature=density_score,
+            )
+        else:
+            voronoi_points, voronoi_scale = gaussians.get_tetra_points(
+                downsample_ratio=None, let_gradients_flow=True,
+                xyz_idx=delaunay_xyz_idx, # Pass the computed indices
+            )
         voronoi_points_count = voronoi_points.shape[0]
         # Recompute Delaunay tetrahedralization if needed
         if delaunay_tets is None:
-            print(f"[INFO] Recomputing Delaunay tetrahedralization for {voronoi_points.shape[0]} points...")
+            print(f"[INFO] Recomputing tetrahedralization for {voronoi_points.shape[0]} points...")
             with torch.no_grad():
-                # Ensure points are detached before passing to C++ extension
-                delaunay_tets = cpp.triangulate(voronoi_points.detach()).cuda().long()
+                # Ensure points are detached before passing to C++ extension.
+                # Plain Delaunay unless config['use_weighted_triangulation'] (then CGAL regular/WDT).
+                if config.get("use_weighted_triangulation", False):
+                    delaunay_tets, n_hidden = compute_triangulation(
+                        voronoi_points, config=config, pivot_scales=voronoi_scale,
+                        return_num_hidden=True, pivot_opacity=voronoi_opacity,
+                        pivot_density=voronoi_density,
+                    )
+                    print(f"[INFO] Weighted triangulation ({config.get('wdt_weight_mode')}, "
+                          f"scale={config.get('wdt_weight_scale')}): {delaunay_tets.shape[0]} tets, "
+                          f"{n_hidden} hidden pivots ({100.0 * n_hidden / max(voronoi_points.shape[0], 1):.1f}%).")
+                else:
+                    delaunay_tets = compute_triangulation(voronoi_points, config=config)
             torch.cuda.empty_cache()
 
         # --- Compute SDF values ---

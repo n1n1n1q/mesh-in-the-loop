@@ -55,7 +55,7 @@ from util import make_dir
 from plot import plot_graph
 
 
-def run_evaluation(dataset_dir, traj_path, ply_path, out_dir, view_crop):
+def run_evaluation(dataset_dir, traj_path, ply_path, out_dir, view_crop, max_itr=20, gt_pcd=None, gt_traj_col=None, gt_already_cropped=False):
     scene = os.path.basename(os.path.normpath(dataset_dir))
 
     if scene not in scenes_tau_dict:
@@ -108,40 +108,67 @@ def run_evaluation(dataset_dir, traj_path, ply_path, out_dir, view_crop):
     pcd.points = o3d.utility.Vector3dVector(vertices)
     ### end add center points
     
-    print(gt_filen)
-    gt_pcd = o3d.io.read_point_cloud(gt_filen)
+    if gt_pcd is None:
+        print(gt_filen)
+        gt_pcd = o3d.io.read_point_cloud(gt_filen)
 
     gt_trans = np.loadtxt(alignment)
     print(traj_path)
     traj_to_register = []
-    if traj_path.endswith('.npy'):
-        ld = np.load(traj_path)
-        for i in range(len(ld)):
-            traj_to_register.append(CameraPose(meta=None, mat=ld[i]))
-    elif traj_path.endswith('.json'): # instant-npg or sdfstudio format
+    
+    # Try to find cameras.json in the same directory as the ply file
+    cameras_json_path = os.path.join(os.path.dirname(ply_path), "cameras.json")
+    if not os.path.isfile(cameras_json_path):
+        cameras_json_path = os.path.join(os.path.dirname(os.path.dirname(ply_path)), "cameras.json")
+        
+    if os.path.isfile(cameras_json_path):
+        print(f"Found cameras.json at {cameras_json_path}. Prioritizing custom reconstruction trajectory.")
         import json
-        with open(traj_path, encoding='UTF-8') as f:
-            meta = json.load(f)
-        poses_dict = {}
-        for i, frame in enumerate(meta['frames']):
-            filepath = frame['file_path']
-            new_i = int(filepath[13:18]) - 1
-            poses_dict[new_i] = np.array(frame['transform_matrix'])
-        poses = []
-        for i in range(len(poses_dict)):
-            poses.append(poses_dict[i])
-        poses = torch.from_numpy(np.array(poses).astype(np.float32))
-        poses, _ = auto_orient_and_center_poses(poses, method='up', center_poses=True)
-        scale_factor = 1.0 / float(torch.max(torch.abs(poses[:, :3, 3])))
-        poses[:, :3, 3] *= scale_factor
-        poses = poses.numpy()
-        for i in range(len(poses)):
-            traj_to_register.append(CameraPose(meta=None, mat=poses[i]))
-
+        with open(cameras_json_path, encoding='UTF-8') as f:
+            cams = json.load(f)
+        
+        # Sort cameras by image name
+        try:
+            cams = sorted(cams, key=lambda c: int(c['img_name']))
+        except ValueError:
+            cams = sorted(cams, key=lambda c: c['img_name'])
+            
+        for c in cams:
+            mat = np.eye(4)
+            mat[:3, :3] = np.array(c['rotation'])
+            mat[:3, 3] = np.array(c['position'])
+            traj_to_register.append(CameraPose(meta=None, mat=mat))
+        print(f"Loaded {len(traj_to_register)} camera poses from cameras.json.")
+    
     else:
-        traj_to_register = read_trajectory(traj_path)
-    print(colmap_ref_logfile)
-    gt_traj_col = read_trajectory(colmap_ref_logfile)
+        if traj_path.endswith('.npy'):
+            ld = np.load(traj_path)
+            for i in range(len(ld)):
+                traj_to_register.append(CameraPose(meta=None, mat=ld[i]))
+        elif traj_path.endswith('.json'): # instant-npg or sdfstudio format
+            import json
+            with open(traj_path, encoding='UTF-8') as f:
+                meta = json.load(f)
+            poses_dict = {}
+            for i, frame in enumerate(meta['frames']):
+                filepath = frame['file_path']
+                new_i = int(filepath[13:18]) - 1
+                poses_dict[new_i] = np.array(frame['transform_matrix'])
+            poses = []
+            for i in range(len(poses_dict)):
+                poses.append(poses_dict[i])
+            poses = torch.from_numpy(np.array(poses).astype(np.float32))
+            poses, _ = auto_orient_and_center_poses(poses, method='up', center_poses=True)
+            scale_factor = 1.0 / float(torch.max(torch.abs(poses[:, :3, 3])))
+            poses[:, :3, 3] *= scale_factor
+            poses = poses.numpy()
+            for i in range(len(poses)):
+                traj_to_register.append(CameraPose(meta=None, mat=poses[i]))
+        else:
+            traj_to_register = read_trajectory(traj_path)
+    if gt_traj_col is None:
+        print(colmap_ref_logfile)
+        gt_traj_col = read_trajectory(colmap_ref_logfile)
 
     trajectory_transform = trajectory_alignment(map_file, traj_to_register,
                                                 gt_traj_col, gt_trans, scene)
@@ -156,12 +183,23 @@ def run_evaluation(dataset_dir, traj_path, ply_path, out_dir, view_crop):
     
     # Registration refinment in 3 iterations
     r2 = registration_vol_ds(pcd, gt_pcd, trajectory_transform, vol, dTau,
-                             dTau * 80, 20)
+                             dTau * 80, max_itr, gt_already_cropped=gt_already_cropped)
     r3 = registration_vol_ds(pcd, gt_pcd, r2.transformation, vol, dTau / 2.0,
-                             dTau * 20, 20)
-    r = registration_unif(pcd, gt_pcd, r3.transformation, vol, 2 * dTau, 20)
+                             dTau * 20, max_itr, gt_already_cropped=gt_already_cropped)
+    r = registration_unif(pcd, gt_pcd, r3.transformation, vol, 2 * dTau, max_itr, gt_already_cropped=gt_already_cropped)
 
     trajectory_transform = r.transformation
+    
+    # Save the aligned mesh
+    aligned_mesh_path = os.path.join(out_dir, f"{scene}_aligned.ply")
+    print(f"Saving aligned mesh to {aligned_mesh_path}...")
+    mesh.apply_transform(trajectory_transform)
+    mesh.export(aligned_mesh_path)
+
+    # Save the transformation matrix
+    transform_path = os.path.join(out_dir, "alignment_transform.txt")
+    print(f"Saving alignment transformation matrix to {transform_path}...")
+    np.savetxt(transform_path, trajectory_transform)
     
     # Histogramms and P/R/F1
     plot_stretch = 5
@@ -183,7 +221,8 @@ def run_evaluation(dataset_dir, traj_path, ply_path, out_dir, view_crop):
         out_dir,
         plot_stretch,
         scene,
-        view_crop
+        view_crop,
+        gt_already_cropped=gt_already_cropped
     )
     eva = [precision, recall, fscore]
     print("==============================")
@@ -207,6 +246,7 @@ def run_evaluation(dataset_dir, traj_path, ply_path, out_dir, view_crop):
         plot_stretch,
         out_dir,
     )
+    return precision, recall, fscore
 
 
 if __name__ == "__main__":
@@ -243,6 +283,12 @@ if __name__ == "__main__":
         default=0,
         help="whether view the crop pointcloud after aligned",
     )
+    parser.add_argument(
+        "--max-itr",
+        type=int,
+        default=20,
+        help="maximum number of ICP iterations",
+    )
     args = parser.parse_args()
 
     args.view_crop = False #  (args.view_crop > 0)
@@ -255,5 +301,6 @@ if __name__ == "__main__":
         traj_path=args.traj_path,
         ply_path=args.ply_path,
         out_dir=args.out_dir,
-        view_crop=args.view_crop
+        view_crop=args.view_crop,
+        max_itr=args.max_itr
     )

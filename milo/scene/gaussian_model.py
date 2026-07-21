@@ -40,10 +40,10 @@ def init_cdf_mask(importance, thres=1.0):
         split_index = ((cumsum_val/vals.sum()) > (1-percent_sum)).nonzero().min()
         split_val_nonprune = vals[split_index]
 
-        non_prune_mask = importance>split_val_nonprune 
-    else: 
+        non_prune_mask = importance>split_val_nonprune
+    else:
         non_prune_mask = torch.ones_like(importance).bool()
-        
+
     return non_prune_mask
 
 
@@ -417,6 +417,8 @@ class GaussianModel:
         scale_points_factor:float=None,
         opacity_threshold:float=None,
         override_opacity:torch.Tensor=None,
+        return_opacity:bool=False,
+        extra_gaussian_feature:torch.Tensor=None,
     ):
         """
         Get the tetra points of the Gaussian model.
@@ -454,6 +456,14 @@ class GaussianModel:
         xyz = self.get_xyz
         scale = self.get_scaling_with_3D_filter * 3.
         rots = build_rotation(self._rotation)
+        # Per-Gaussian opacity, carried through the same filtering/downsampling as xyz/scale/rots
+        # so it stays pivot-aligned. Only used by the weighted-triangulation `opacity` weight mode.
+        if return_opacity:
+            pivot_opacity = self.get_opacity_with_3D_filter.reshape(-1, 1)
+        # Arbitrary per-Gaussian feature (e.g. density-importance score) carried through the same
+        # filtering/downsampling as xyz so it stays pivot-aligned; broadcast to pivots at the end.
+        if extra_gaussian_feature is not None:
+            extra_feat = extra_gaussian_feature.reshape(-1, 1).to(xyz.device)
         if return_sdf_values:
             if not self.use_sdf_values:
                 raise ValueError("SDF values are not used")
@@ -471,6 +481,10 @@ class GaussianModel:
             xyz = xyz[mask]
             scale = scale[mask]
             rots = rots[mask]
+            if return_opacity:
+                pivot_opacity = pivot_opacity[mask]
+            if extra_gaussian_feature is not None:
+                extra_feat = extra_feat[mask]
             if return_sdf_values:
                 sdf_values = sdf_values[mask]
                 
@@ -501,6 +515,10 @@ class GaussianModel:
             elif scale_points_factor is not None:
                 scale = scale * scale_points_factor
             rots = rots[xyz_idx]
+            if return_opacity:
+                pivot_opacity = pivot_opacity[xyz_idx]
+            if extra_gaussian_feature is not None:
+                extra_feat = extra_feat[xyz_idx]
             if return_sdf_values:
                 sdf_values = sdf_values[xyz_idx]
             if verbose:
@@ -519,11 +537,19 @@ class GaussianModel:
         scale = scale.max(dim=-1, keepdim=True)[0]
         scale_corner = scale.repeat(1, 8).reshape(-1, 1)
         vertices_scale = torch.cat([scale_corner, scale], dim=0)
-        
+
+        # Existing return arity is preserved exactly; opacity is appended only when asked for.
+        outputs = [vertices, vertices_scale]
         if return_sdf_values:
-            return vertices, vertices_scale, sdf_values
-        else:
-            return vertices, vertices_scale
+            outputs.append(sdf_values)
+        if return_opacity:
+            # Same [8 corners per Gaussian, then centers] layout as vertices / vertices_scale.
+            opacity_corner = pivot_opacity.repeat(1, 8).reshape(-1, 1)
+            outputs.append(torch.cat([opacity_corner, pivot_opacity], dim=0))
+        if extra_gaussian_feature is not None:
+            extra_corner = extra_feat.repeat(1, 8).reshape(-1, 1)
+            outputs.append(torch.cat([extra_corner, extra_feat], dim=0))
+        return tuple(outputs) if len(outputs) > 2 else (vertices, vertices_scale)
         
     def get_tetra_points(
         self, 
@@ -1379,14 +1405,14 @@ class GaussianModel:
 
 
         imp_score[accum_area_max==0]=0
-        non_prune_mask = init_cdf_mask(importance=imp_score, thres=0.99) 
+        non_prune_mask = init_cdf_mask(importance=imp_score, thres=0.99)
 
         self.factor_culling=count_vis/(count_rad+1e-1)
 
 
         prune_mask = (count_vis<=1)[:,0]
         prune_mask = torch.logical_or(prune_mask, non_prune_mask==False)
-        self.prune_points(prune_mask) 
+        self.prune_points(prune_mask)
 
 
     # interesction_sampling with visibility_culling
@@ -1431,7 +1457,7 @@ class GaussianModel:
         factor=args.sampling_factor
         N_xyz=self._xyz.shape[0]
         num_sampled=int(N_xyz*factor*((prob!=0).sum()/prob.shape[0]))
-        indices = np.random.choice(N_xyz, size=num_sampled, 
+        indices = np.random.choice(N_xyz, size=num_sampled,
                                     p=prob, replace=False)
 
         non_prune_mask = np.zeros(N_xyz, dtype=bool)
@@ -1442,7 +1468,7 @@ class GaussianModel:
 
         prune_mask = (count_vis<=1)[:,0]
         prune_mask = torch.logical_or(prune_mask, torch.tensor(non_prune_mask==False, device='cuda'))
-        self.prune_points(prune_mask) 
+        self.prune_points(prune_mask)
 
 
     # importance_pruning with visibility_culling
@@ -1478,6 +1504,30 @@ class GaussianModel:
         prune_mask = torch.logical_or(prune_mask, non_prune_mask==False)
         self.prune_points(prune_mask) 
 
+
+    @torch.no_grad()
+    def compute_importance_score(self, scene, render_simp, iteration, args, pipe, background):
+        """Per-Gaussian Mini-Splatting importance (the `imp_score` used for surface sampling/pruning),
+        without the sampling step. Same view loop as `sample_surface_gaussians`. Used by the WDT
+        `density` weight mode (imp_score / distCUDA2, the `--prune_rule density` signal)."""
+        imp_score = torch.zeros(self._xyz.shape[0]).cuda()
+        accum_area_max = torch.zeros(self._xyz.shape[0]).cuda()
+        views = scene.getTrainCameras_warn_up(iteration, args.warn_until_iter, scale=1.0, scale2=2.0).copy()
+        culling = torch.zeros((self._xyz.shape[0], len(views)), dtype=torch.bool, device='cuda')
+        for view in views:
+            render_pkg = render_simp(view, self, pipe, background, culling=culling[:, view.uid])
+            accum_weights = render_pkg["accum_weights"]
+            area_proj = render_pkg["area_proj"]
+            area_max = render_pkg["area_max"]
+            accum_area_max = accum_area_max + area_max
+            if args.imp_metric == 'outdoor':
+                mask_t = area_max != 0
+                temp = imp_score + accum_weights / area_proj
+                imp_score[mask_t] = temp[mask_t]
+            else:
+                imp_score = imp_score + accum_weights
+        imp_score[accum_area_max == 0] = 0
+        return imp_score
 
     def extend_features_rest(self):
 

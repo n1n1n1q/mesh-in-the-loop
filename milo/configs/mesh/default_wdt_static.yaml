@@ -66,6 +66,10 @@ radius_culling: -1.0  # -1.0 for no culling
 # When on, MILo's Delaunay is replaced by a CGAL regular (weighted / Laguerre) triangulation
 # (dmesh2 mindiffdt._C.compute_wdt). Non-differentiable: static per-pivot weights, no gradients.
 # With wdt_weight_mode == "none" the regular triangulation reproduces the Delaunay tet set.
-use_weighted_triangulation: false
-wdt_weight_mode: "none"      # "none" | "scale_sq" | "aniso"
-wdt_weight_scale: 0.0        # global multiplier on the per-pivot length scale before squaring
+# THE EXPERIMENT: static geometric weights. Big Gaussians bury thin/flat pivots a fat neighbour
+# already covers. wdt_weight_scale is chosen from the offline hidden-fraction sweep (~5-20% hidden).
+use_weighted_triangulation: true
+wdt_weight_mode: "scale_sq"  # "none" | "scale_sq" | "aniso"
+# 0.06 -> ~11% hidden pivots on Truck (scale sweep: 0.05->6.4%, 0.07->16.6%), inside the 5-20%
+# "prune without gutting" band. Scales above ~0.1 bury >35% (huge scale range [0.003,91]).
+wdt_weight_scale: 0.06       # global multiplier on the per-pivot length scale before squaring

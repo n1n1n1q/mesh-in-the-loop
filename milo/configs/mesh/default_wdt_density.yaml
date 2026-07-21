@@ -66,6 +66,11 @@ radius_culling: -1.0  # -1.0 for no culling
 # When on, MILo's Delaunay is replaced by a CGAL regular (weighted / Laguerre) triangulation
 # (dmesh2 mindiffdt._C.compute_wdt). Non-differentiable: static per-pivot weights, no gradients.
 # With wdt_weight_mode == "none" the regular triangulation reproduces the Delaunay tet set.
-use_weighted_triangulation: false
-wdt_weight_mode: "none"      # "none" | "scale_sq" | "aniso"
-wdt_weight_scale: 0.0        # global multiplier on the per-pivot length scale before squaring
+# THE DENSITY ARM (user idea): weight burial by the --prune_rule density signal, the project's
+# best on-surface signal (imp_score/distCUDA2, F1 0.6372). w_i = (scale*s_i)^2 * rank01(imp/dist):
+# high density-importance pivots keep large power cells and survive; low ones are buried first.
+# Directly targets the recall collapse that sank scale_sq/opacity (which buried load-bearing sites).
+# wdt_weight_scale auto-set by scripts/wdt_hidden_sweep.py --mode density --target-hidden 11.6.
+use_weighted_triangulation: true
+wdt_weight_mode: "density"   # "none" | "scale_sq" | "aniso" | "opacity" | "density"
+wdt_weight_scale: 0.07       # chosen by density sweep to match ~11.6% hidden

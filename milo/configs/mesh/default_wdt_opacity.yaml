@@ -66,6 +66,12 @@ radius_culling: -1.0  # -1.0 for no culling
 # When on, MILo's Delaunay is replaced by a CGAL regular (weighted / Laguerre) triangulation
 # (dmesh2 mindiffdt._C.compute_wdt). Non-differentiable: static per-pivot weights, no gradients.
 # With wdt_weight_mode == "none" the regular triangulation reproduces the Delaunay tet set.
-use_weighted_triangulation: false
-wdt_weight_mode: "none"      # "none" | "scale_sq" | "aniso"
-wdt_weight_scale: 0.0        # global multiplier on the per-pivot length scale before squaring
+# THE OPACITY ARM (kill-criterion follow-up to default_wdt_static's F1 0.5104 loss).
+# w_i = (scale * s_i)^2 * opacity_i -- still locally scaled, but survival is tied to *photometric*
+# importance instead of pure geometry. Hypothesis: scale_sq lost recall because geometry-blind
+# burying removed load-bearing sites; weighting by opacity should bury the sites that don't matter.
+# wdt_weight_scale is auto-set by scripts/wdt_hidden_sweep.py --mode opacity --target-hidden 11.6
+# so this arm buries the SAME fraction as the static arm -- isolating *which* sites get buried.
+use_weighted_triangulation: true
+wdt_weight_mode: "opacity"   # "none" | "scale_sq" | "aniso" | "opacity"
+wdt_weight_scale: 0.08       # chosen by opacity sweep to match ~11.6% hidden

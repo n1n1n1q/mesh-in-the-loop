@@ -66,6 +66,8 @@ radius_culling: -1.0  # -1.0 for no culling
 # When on, MILo's Delaunay is replaced by a CGAL regular (weighted / Laguerre) triangulation
 # (dmesh2 mindiffdt._C.compute_wdt). Non-differentiable: static per-pivot weights, no gradients.
 # With wdt_weight_mode == "none" the regular triangulation reproduces the Delaunay tet set.
-use_weighted_triangulation: false
+# End-to-end INVARIANT run: feature ON but weights zero -> regular triangulation == Delaunay.
+# Expect F1 == default (0.5642 +/- 0.0003). Isolates "did wiring the weighted path in change anything."
+use_weighted_triangulation: true
 wdt_weight_mode: "none"      # "none" | "scale_sq" | "aniso"
 wdt_weight_scale: 0.0        # global multiplier on the per-pivot length scale before squaring
