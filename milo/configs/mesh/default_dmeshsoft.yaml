@@ -1,0 +1,97 @@
+# Mesh-in-the-loop with the FAITHFUL DMesh++ differentiable meshing REPLACING marching-tetrahedra.
+#
+# Soft face existence  Lambda(F) = Lambda_min(positions) * Lambda_real(realness):
+#   Lambda_min  = sigmoid(dmesh_alpha * minball empty-ball margin)   [mindiffdt, diff. in positions]
+#   Lambda_real = prod over the 3 verts of sigmoid(occupancy logit)  [reuses the learnable SDF slot]
+# The mesh is rendered through the dmesh2 soft renderer with Lambda as per-face opacity, and
+# supervised by RGB self-distillation vs the Gaussians' own render over the mesh-covered pixels.
+# Gradient flows to Gaussian geometry through BOTH the triangulation predicate (Lambda_min) AND the
+# vertex positions, and to per-pivot realness. Verified by diffmesh/probe_dmesh_softlambda.py.
+#
+# Toggle: `use_dmesh_soft_mesh: true`. Every other config stays on marching-tets.
+
+# Regularization schedule
+start_iter: 8_001
+mesh_update_interval: 1
+stop_iter: 18000
+
+# --- DMesh++ soft meshing ---
+use_dmesh_soft_mesh: true
+dmesh_alpha: 30.0        # Lambda_min sharpness in normalized ([-1,1]^3) coords
+dmesh_rgb_weight: 0.05   # weight on the RGB self-distillation mesh loss
+# Geometry supervision: L1 between the soft mesh depth and the Gaussians' median depth (converted
+# into the renderer's normalized-NDC depth space), over mesh-covered pixels. This is the signal cband
+# uses (depth/normal) that plain RGB self-distill lacks; 0 disables it.
+# MEASURED SATURATED: F1 is FLAT (~0.669 at 18k, within noise) across depth ∈ [0.05, 0.3] — the
+# depth_loss sits at its floor (~0.002, mesh depth already matches), so more weight has nothing to
+# bite. Kept at the best-known value.
+dmesh_depth_weight: 0.05
+# Normal self-distillation: (1 - cos) between the soft mesh's view-space normals (recovered from its
+# NDC depth) and the Gaussians' median-depth normals, over mesh-covered pixels. In principle the other
+# half of cband's geometry signal (orientation, not just range). MEASURED NEUTRAL: sweeping the weight
+# 0 -> 0.02 -> 0.1 leaves 18k F1 flat (0.6693 / 0.6675 / 0.6693) within the ±0.0003 noise floor — the
+# cband extractor reads pivot POSITIONS, which the main photometric loss dominates, so this small
+# mesh-reg nudge doesn't move the extracted surface. Left OFF by default; code path stays available
+# for a cleaner (multi-view-consistent) target, which is the only lever that could close the cband gap.
+dmesh_normal_weight: 0.0
+# Speed: skip the per-pixel AA overlap-area computation (0), and render/supervise at reduced scale.
+dmesh_aa_temperature: 0.0
+dmesh_render_scale: 0.5
+# Run the expensive differentiable soft render (minball + per-view cull + dmesh2 fwd/bwd on ~10M
+# faces) only every N iters -> ~N x cheaper mesh-reg (photometric loss + optimizer step stay per-iter;
+# the every-500 Delaunay refresh is preserved, and reset iters are always soft iters). 1 = every iter.
+dmesh_soft_interval: 4
+
+# Depth/normal losses are replaced by the RGB self-distill loss above -> off.
+use_depth_loss: false
+depth_weight: 0.0
+depth_ratio: 1.0
+mesh_depth_loss_type: "log"
+use_normal_loss: false
+normal_weight: 0.0
+use_depth_normal: true
+
+# Delaunay computation (candidate faces). Capped lower than default to keep the per-iteration soft
+# render + backward tractable (soft render of every candidate face each step).
+delaunay_reset_interval: 500
+# dmesh2 render_backward_cuda hits an illegal-memory-access above ~17M faces (int32 index limit in the
+# third-party kernel); 1.5M pivots -> 19.7M faces crashed. Cap pivots so faces stay well under that.
+n_max_points_in_delaunay: 800_000  # -> ~10M candidate faces
+delaunay_sampling_method: "surface"
+filter_large_edges: false
+collapse_large_edges: false
+
+# Rasterization (unused: dmesh2 renderer is used instead of MeshRenderer)
+use_scalable_renderer: false
+
+# SDF computation (UNUSED in dmesh-soft: realness is trained by the render loss, never reset)
+sdf_reset_interval: 500
+sdf_default_isosurface: 0.5
+transform_sdf_to_linear_space: false
+min_occupancy_value: 0.0000000001
+use_ema: true
+alpha_ema: 0.4
+trunc_margin: 0.002
+occupancy_mode: "occupancy_shift"
+enforce_occupied_centers: false
+occupied_centers_weight: 0.005
+use_occupancy_labels_loss: false
+reset_occupancy_labels_every: 200
+occupancy_labels_loss_weight: 0.005
+fix_set_of_learnable_sdfs: true
+learnable_sdf_reset_mode: "none"
+learnable_sdf_reset_stop_iter: 13001
+learnable_sdf_reset_alpha_ema: 0.4
+method_to_reset_sdf: "depth_fusion"
+n_binary_steps_to_reset_sdf: 0
+sdf_reset_linearization_n_steps: 20
+sdf_reset_linearization_enforce_std: 0.5
+depth_fusion_reset_tolerance: 0.1
+
+# Foreground Culling
+radius_culling: -1.0
+
+# Weighted triangulation (off)
+use_weighted_triangulation: false
+wdt_weight_mode: "none"
+wdt_weight_scale: 0.0
