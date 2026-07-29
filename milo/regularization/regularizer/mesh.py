@@ -118,6 +118,38 @@ def viewz_to_normal(viewpoint_cam, view_z, H, W):
     return out                                                                        # (3, H, W)
 
 
+def triangle_quality_loss(verts, faces, lam):
+    """
+    DMesh++ Triangle-Quality Loss
+    """
+    v = verts[faces.long()]                                  # (F, 3, 3)
+    e0, e1, e2 = v[:, 1] - v[:, 0], v[:, 2] - v[:, 1], v[:, 0] - v[:, 2]
+    a, b, c = e0.norm(dim=-1), e1.norm(dim=-1), e2.norm(dim=-1)
+    area = 0.5 * torch.cross(e0, -e2, dim=-1).norm(dim=-1) + 1e-9
+    lmax = torch.maximum(torch.maximum(a, b), c)
+    ar = (lmax * (a + b + c)) / (area * 6.928203)            # equilateral -> ~1.0
+    w = lam.detach()
+    return (ar * w).sum() / w.sum().clamp(min=1e-6)
+
+
+def chamfer_selfdistill_loss(mesh_pts, target_pts, scale=1.0, max_pts=30000):
+    """Bidirectional Chamfer"""
+    from scipy.spatial import cKDTree
+    if mesh_pts.shape[0] == 0 or target_pts.shape[0] == 0:
+        return torch.zeros((), device=mesh_pts.device)
+    if mesh_pts.shape[0] > max_pts:
+        mesh_pts = mesh_pts[torch.randperm(mesh_pts.shape[0], device=mesh_pts.device)[:max_pts]]
+    if target_pts.shape[0] > max_pts:
+        target_pts = target_pts[torch.randperm(target_pts.shape[0], device=target_pts.device)[:max_pts]]
+    mp = mesh_pts.detach().cpu().numpy()
+    tp = target_pts.detach().cpu().numpy()
+    nn_m2t = torch.as_tensor(cKDTree(tp).query(mp, k=1)[1], device=mesh_pts.device, dtype=torch.long)
+    nn_t2m = torch.as_tensor(cKDTree(mp).query(tp, k=1)[1], device=mesh_pts.device, dtype=torch.long)
+    d_m2t = ((mesh_pts - target_pts[nn_m2t]) / scale).norm(dim=-1).mean()      # grad -> mesh_pts
+    d_t2m = ((mesh_pts[nn_t2m] - target_pts) / scale).norm(dim=-1).mean()      # grad -> mesh_pts
+    return d_m2t + d_t2m
+
+
 def compute_dmesh_soft_regularization(
     voronoi_points, delaunay_tets, delaunay_xyz_idx, gaussians, viewpoint_cam,
     target_image, config, mesh_state, target_depth=None,
@@ -160,7 +192,8 @@ def compute_dmesh_soft_regularization(
             nearest = nearest_excluding_face(ball.center, facesL, pts_n.detach())
         mesh_state["dmesh_nearest"] = nearest
     sdist = torch.norm(pts_n[nearest] - ball.center, dim=-1) - ball.radius  # differentiable in pts
-    lam_min = torch.sigmoid(config["dmesh_alpha"] * sdist) * stable.float().detach()
+    alpha = float(config["dmesh_alpha"])
+    lam_min = torch.sigmoid(alpha * sdist) * stable.float().detach()
 
     # Lambda_real(realness): product over the 3 verts of sigmoid(occupancy logit), aligned to pivots.
     occ_logit = gaussians.get_occupancy_logit
@@ -219,22 +252,50 @@ def compute_dmesh_soft_regularization(
     if (Hr, Wr) != (H, W):
         tgt = torch.nn.functional.interpolate(tgt[None], size=(Hr, Wr), mode="bilinear", align_corners=False)[0]
     tgt = tgt.permute(1, 2, 0)                            # (Hr, Wr, 3)
-    cover_full = (mesh_depth > 0).detach()               # (legacy: uncovered sentinel is 0.5 -> ~all pixels)
+    cover_full = (mesh_depth > 0).detach()               # covered = face rendered here; uncovered sentinel is exactly 0.0
     l1 = (mesh_img - tgt).abs().mean(dim=-1)
     rgb_loss = (l1 * cover_full).sum() / cover_full.sum().clamp(min=1)
     mesh_loss = config["dmesh_rgb_weight"] * rgb_loss
 
-    # Depth self-distillation 
+    # Depth self-distillation
+    #
+    # Covered = a face actually rendered here. The renderer's uncovered/background sentinel is EXACTLY
+    # 0.0 (out_depth = D[0] + T*1.0 with T=1 for uncovered -> raw 1.0 -> (1-(1+1)/2)=0.0; verified
+    # empirically). Covered pixels are strictly > 0. The old `|depth-0.5|>1e-4` test used the WRONG
+    # sentinel (0.5): it marked background as covered -> the depth loss was averaged over the whole
+    # frame -> diluted/no-bite gradient (this is what looked like "saturation" in the weight sweeps).
     depth_loss = torch.zeros((), device=mesh_loss.device)
     if depth_w > 0.0 and target_depth is not None:
+        mesh_covered = mesh_depth > 0.0
+        # if config.get("dmesh_depth_metric", False):
+        # METRIC-space depth loss (mirrors MILo's working hard depth loss). The renderer outputs
+        # depth in normalized-NDC space, which for MILo cameras (znear 0.01, zfar 100) compresses
+        # the ENTIRE scene into a ~0.002-wide sliver near 0 -> ~no dynamic range. Invert it back to
+        # metric view-z and compare with the log-L1 MILo uses. The inversion amplifies gradients
+        # hugely near the far plane, so only supervise covered pixels (mesh_depth>0) and clamp z.
+        znear, zfar = float(viewpoint_cam.znear), float(viewpoint_cam.zfar)
+        k = zfar / (zfar - znear)
+        ndc_z_mesh = 1.0 - 2.0 * mesh_depth
+        vz_mesh = (k * znear / (k - ndc_z_mesh).clamp_min(1e-4)).clamp(znear, zfar)  # metric, diff
         with torch.no_grad():
-            tgt_dn, valid = target_depth_in_renderer_space(viewpoint_cam, target_depth, proj)
+            vz_tgt = target_depth.squeeze()
             if (Hr, Wr) != (H, W):
-                tgt_dn = torch.nn.functional.interpolate(tgt_dn[None, None], size=(Hr, Wr), mode="nearest")[0, 0]
-                valid = torch.nn.functional.interpolate(valid[None, None].float(), size=(Hr, Wr), mode="nearest")[0, 0] > 0.5
-        mesh_covered = (mesh_depth - 0.5).abs() > 1e-4
+                vz_tgt = torch.nn.functional.interpolate(
+                    vz_tgt[None, None], size=(Hr, Wr), mode="nearest")[0, 0]
+            valid = vz_tgt > 0
         dmask = mesh_covered & valid
-        depth_loss = ((mesh_depth - tgt_dn).abs() * dmask).sum() / dmask.sum().clamp(min=1)
+        scale = gaussians.spatial_lr_scale
+        depth_loss = (torch.log(1.0 + (vz_mesh - vz_tgt).abs() / scale) * dmask
+                        ).sum() / dmask.sum().clamp(min=1)
+        # else:
+        #     # Legacy NDC-space depth loss (kept for comparison; low dynamic range, see above).
+        #     with torch.no_grad():
+        #         tgt_dn, valid = target_depth_in_renderer_space(viewpoint_cam, target_depth, proj)
+        #         if (Hr, Wr) != (H, W):
+        #             tgt_dn = torch.nn.functional.interpolate(tgt_dn[None, None], size=(Hr, Wr), mode="nearest")[0, 0]
+        #             valid = torch.nn.functional.interpolate(valid[None, None].float(), size=(Hr, Wr), mode="nearest")[0, 0] > 0.5
+        #     dmask = mesh_covered & valid
+        #     depth_loss = ((mesh_depth - tgt_dn).abs() * dmask).sum() / dmask.sum().clamp(min=1)
         mesh_loss = mesh_loss + depth_w * depth_loss
 
     # Normal self-distillation
@@ -252,47 +313,59 @@ def compute_dmesh_soft_regularization(
             n_tgt = viewz_to_normal(viewpoint_cam, vz_tgt, Hr, Wr)
             tgt_ok = (n_tgt.norm(dim=0) > 0.5) & (vz_tgt > 0)
         n_mesh = viewz_to_normal(viewpoint_cam, vz_mesh, Hr, Wr)
-        mesh_covered_n = (mesh_depth - 0.5).abs() > 1e-4
+        mesh_covered_n = mesh_depth > 0.0   # uncovered sentinel is 0.0, not 0.5 (see depth mask above)
         nmask = mesh_covered_n & tgt_ok
         cosim = (n_mesh * n_tgt).sum(dim=0)
         normal_loss = ((1.0 - cosim) * nmask).sum() / nmask.sum().clamp(min=1)
         mesh_loss = mesh_loss + normal_w * normal_loss
+
+    # DMesh++ Triangle-Quality Loss (Eq. 14) -- position-routed mesh-quality regularizer.
+    qual_w = float(config.get("dmesh_qual_weight", 0.0))
+    qual_loss = torch.zeros((), device=mesh_loss.device)
+    if qual_w > 0.0 and nF_v > 0:
+        qual_loss = triangle_quality_loss(voronoi_points, faces_v, lam_v)
+        mesh_loss = mesh_loss + qual_w * qual_loss
+
+    # DMesh++ reconstruction loss, point-cloud variant: bidirectional CHAMFER between the mesh surface
+    # (this view's rendered depth, differentiable) and the observed surface (the Gaussians' depth).
+    # A DIRECT 3D position loss, unlike the view-projected depth self-distill. Needs full-res depth
+    # (depths_to_points reshapes to H,W) -> the chamfer config sets dmesh_render_scale 1.0.
+    chamfer_w = float(config.get("dmesh_chamfer_weight", 0.0))
+    chamfer_loss = torch.zeros((), device=mesh_loss.device)
+    if chamfer_w > 0.0 and target_depth is not None and (Hr, Wr) == (H, W):
+        znear, zfar = float(viewpoint_cam.znear), float(viewpoint_cam.zfar)
+        kk = zfar / (zfar - znear)
+        vz_mesh_c = (kk * znear / (kk - (1.0 - 2.0 * mesh_depth)).clamp_min(1e-4)).clamp(znear, zfar)
+        covered_c = (mesh_depth > 0.0).reshape(-1)
+        # Foreground cap: the mesh only covers the object, but the Gaussian-depth target extends to the
+        # far background -> those far points dominate the Chamfer. Cap both clouds at ~1.5x the mesh's
+        # covered-depth 90th percentile so the match stays on the reconstructed object.
+        with torch.no_grad():
+            vz_tgt_c = target_depth.squeeze()
+            mvz = vz_mesh_c.reshape(-1)[covered_c]
+            zcap = (torch.quantile(mvz, 0.9) * 1.5) if mvz.numel() > 0 else zfar
+        fg_mesh = covered_c & (vz_mesh_c.reshape(-1) < zcap)
+        mesh_pts = depths_to_points(viewpoint_cam, vz_mesh_c).reshape(3, -1).t()[fg_mesh]  # diff
+        with torch.no_grad():
+            valid_c = (vz_tgt_c > 0).reshape(-1) & (vz_tgt_c.reshape(-1) < zcap)
+            target_pts = depths_to_points(viewpoint_cam, vz_tgt_c).reshape(3, -1).t()[valid_c]
+        chamfer_loss = chamfer_selfdistill_loss(mesh_pts, target_pts.detach(),
+                                                scale=max(gaussians.spatial_lr_scale, 1e-6))
+        mesh_loss = mesh_loss + chamfer_w * chamfer_loss
 
     cover = cover_full
     return {
         "mesh_loss": mesh_loss,
         "depth_loss": float(depth_loss),
         "normal_loss": float(normal_loss),
+        "qual_loss": float(qual_loss),
+        "chamfer_loss": float(chamfer_loss),
         "lam_min_on": float((lam_min > 0.5).float().mean()),
         "lam_real_mean": float(lam_real.mean()),
         "n_faces": nF,
         "n_faces_visible": nF_v,
         "coverage": float(cover.float().mean()),
     }
-
-
-def centroid_band_faces(
-    tets: torch.Tensor,
-    pivot_tsdf: torch.Tensor,
-    pool_band: float,
-    cut: float,
-) -> torch.Tensor:
-    """
-    Face-centroid TSDF band extractor for mesh-in-the-loop.
-    """
-    tets = tets.long()
-    # Process the 4 triangular faces of each tet sequentially and keep only survivors, to avoid
-    # materialising all ~4*N_tets faces at once inside the training loop.
-    kept = []
-    for combo in ([0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]):
-        f = tets[:, combo]              # (N_tets, 3)
-        tf = pivot_tsdf[f]             # (N_tets, 3)
-        keep = (tf.abs() < pool_band).all(dim=1) & (tf.mean(dim=1).abs() < cut)
-        kept.append(f[keep])
-    faces = torch.cat(kept, dim=0)
-    faces = torch.sort(faces, dim=1)[0]
-    faces = torch.unique(faces, dim=0)  # dedup faces shared by adjacent tets
-    return faces
 
 
 def initialize_mesh_regularization(
@@ -318,6 +391,7 @@ def initialize_mesh_regularization(
     print(f"         > Mesh depth loss type: {config['mesh_depth_loss_type']}")
     print(f"         > Occupancy mode: {config['occupancy_mode']}")
         
+    # DMesh-soft meshing uses the dmesh2 renderer, not nvdiffrast -> skip the MeshRasterizer.
     if config.get("use_dmesh_soft_mesh", False):
         print("[INFO] DMesh-soft meshing: skipping nvdiffrast MeshRasterizer (uses dmesh2 renderer).")
         mesh_renderer = None
@@ -402,10 +476,6 @@ def compute_mesh_regularization(
     lambda_mesh_depth = config["depth_weight"]
     lambda_mesh_normal = config["normal_weight"]
 
-    # DMesh++ meshing replaces marching-tetrahedra: instead of extracting the isosurface of a
-    # learnable SDF, the mesh IS the face-centroid-band selection of the Delaunay faces of the
-    # pivots (verts = pivots, so the render loss still flows to Gaussian geometry)
-    use_cband = config.get("use_centroid_band_mesh", False)
     # Faithful DMesh++ differentiable meshing: soft Lambda(F) rendered with per-face opacity, RGB
     # self-distillation loss, gradient to positions (via Lambda_min + vertex pos) and realness.
     use_dmesh_soft = config.get("use_dmesh_soft_mesh", False)
@@ -444,11 +514,8 @@ def compute_mesh_regularization(
 
         if config["fix_set_of_learnable_sdfs"] and (iteration > config["start_iter"]):
             reset_delaunay_samples = False
-            
-        if (not use_cband) and (config["learnable_sdf_reset_mode"] == "none") and (iteration > config["start_iter"]):
-            reset_sdf_values = False  # TODO: Maybe not needed?
 
-        if (not use_cband) and (iteration >= config["learnable_sdf_reset_stop_iter"]):
+        if (iteration >= config["learnable_sdf_reset_stop_iter"]):
             assert iteration > config["start_iter"]
             reset_sdf_values = False
     else:
@@ -621,8 +688,6 @@ def compute_mesh_regularization(
                 else:
                     delaunay_tets = compute_triangulation(voronoi_points, config=config)
             torch.cuda.empty_cache()
-            if use_cband:
-                mesh_state["cband_faces"] = None  # connectivity changed -> rebuild face set
             if use_dmesh_soft:
                 mesh_state["dmesh_faces"] = None  # connectivity changed -> rebuild candidate faces
 
@@ -630,6 +695,7 @@ def compute_mesh_regularization(
         # and return early 
         if use_dmesh_soft:
             z = torch.zeros(size=(), device=gaussians._xyz.device)
+
             soft_interval = int(config.get("dmesh_soft_interval", 1))
             is_soft_iter = (
                 (soft_interval <= 1)
@@ -656,11 +722,14 @@ def compute_mesh_regularization(
                     print(f"[INFO] (dmesh-soft) it {iteration}: loss {soft['mesh_loss'].item():.5f}, "
                           f"depth_loss {soft.get('depth_loss', 0.0):.5f}, "
                           f"normal_loss {soft.get('normal_loss', 0.0):.5f}, "
+                          f"qual {soft.get('qual_loss', 0.0):.5f}, "
+                          f"chamfer {soft.get('chamfer_loss', 0.0):.5f}, "
                           f"faces {soft['n_faces_visible']}/{soft['n_faces']} vis, "
                           f"Lambda_min>0.5 {100*soft['lam_min_on']:.1f}%, "
                           f"Lambda_real mean {soft['lam_real_mean']:.3f}, coverage {100*soft['coverage']:.1f}%")
             else:
-                soft_mesh_loss = z  # skipped iter: no mesh gradient this step
+                soft_mesh_loss = z  # skipped iter: no soft mesh gradient this step
+
             mesh_state["delaunay_xyz_idx"] = delaunay_xyz_idx
             mesh_state["delaunay_tets"] = delaunay_tets
             mesh_state["reset_delaunay_samples"] = reset_delaunay_samples
@@ -687,27 +756,6 @@ def compute_mesh_regularization(
                 print(f"[WARNING] Delaunay SDFs ({n_voronoi_sdf}) and points ({voronoi_points.shape[0]}) count mismatch. Resetting SDFs.")
                 reset_sdf_values = True
         
-        if reset_sdf_values and use_cband:
-            # DMesh++ meshing: no learnable SDF. Just fuse the per-pivot depth-fusion TSDF
-            # that drives the face-centroid band, cache it, and force a face rebuild.
-            with torch.no_grad():
-                pivot_tsdf = evaluate_sdf_values_depth_fusion(
-                    points=voronoi_points,
-                    views=scene.getTrainCameras().copy(),
-                    masks=None,
-                    gaussians=gaussians,
-                    pipeline=pipe,
-                    background=background,
-                    kernel_size=kernel_size,
-                    return_colors=False,
-                    trunc_margin=None,
-                    render_func=render_func,
-                )
-                mesh_state["pivot_tsdf"] = pivot_tsdf.detach().float()
-                mesh_state["cband_faces"] = None
-                print(f"[INFO] (cband) Re-fused per-pivot TSDF for {voronoi_points.shape[0]} pivots.")
-            reset_sdf_values = False
-
         if reset_sdf_values:
             with torch.no_grad():
                 # Get base occupancy values for all voronoi points
@@ -792,65 +840,44 @@ def compute_mesh_regularization(
             
                 reset_sdf_values = False # Reset flag after computation
         
-        if use_cband:
-            # --- DMesh++ meshing (replaces Marching Tetrahedra) ---
-            # verts ARE the pivots (differentiable w.r.t. Gaussian geometry); faces are the
-            # Delaunay faces kept by the face-centroid TSDF band. The selection is a hard,
-            # periodically-recomputed mask cached in mesh_state (rebuilt on Delaunay/TSDF reset),
-            # exactly like the tet connectivity. The render loss below flows verts -> Gaussians.
-            verts = voronoi_points
-            cband_faces = mesh_state.get("cband_faces", None)
-            if cband_faces is None:
-                with torch.no_grad():
-                    cband_faces = centroid_band_faces(
-                        delaunay_tets,
-                        mesh_state["pivot_tsdf"],
-                        pool_band=config.get("centroid_pool_band", 1.2),
-                        cut=config.get("centroid_band_cut", 0.4),
-                    )
-                mesh_state["cband_faces"] = cband_faces
-                print(f"[INFO] (cband) Built {cband_faces.shape[0]} faces "
-                      f"(pool {config.get('centroid_pool_band', 1.2)}, cut {config.get('centroid_band_cut', 0.4)}).")
-            faces = cband_faces
+        # Convert learnable occupancy values to SDF
+        if delaunay_xyz_idx is not None:
+            current_occupancy = gaussians.get_occupancy[delaunay_xyz_idx]  # (N_sampled_gaussians, 9)
         else:
-            # Convert learnable occupancy values to SDF
-            if delaunay_xyz_idx is not None:
-                current_occupancy = gaussians.get_occupancy[delaunay_xyz_idx]  # (N_sampled_gaussians, 9)
-            else:
-                current_occupancy = gaussians.get_occupancy  # (N_gaussians, 9)
-            current_voronoi_sdf = convert_occupancy_to_sdf(
-                flatten_voronoi_features(current_occupancy)
-            )  # (N_voronoi_points, )
+            current_occupancy = gaussians.get_occupancy  # (N_gaussians, 9)
+        current_voronoi_sdf = convert_occupancy_to_sdf(
+            flatten_voronoi_features(current_occupancy)
+        )  # (N_voronoi_points, )
 
-            # --- Marching Tetrahedra ---
-            verts_list, scale_list, faces_list, _ = marching_tetrahedra(
-                vertices=voronoi_points[None],
-                tets=delaunay_tets,
-                sdf=current_voronoi_sdf.reshape(1, -1), # Use the computed SDF for this iteration
-                scales=voronoi_scale[None]
-            )
-            end_points, end_sdf = verts_list[0]  # (N_verts, 2, 3) and (N_verts, 2, 1)
-            end_scales = scale_list[0]  # (N_verts, 2, 1)
+        # --- Marching Tetrahedra ---
+        verts_list, scale_list, faces_list, _ = marching_tetrahedra(
+            vertices=voronoi_points[None],
+            tets=delaunay_tets,
+            sdf=current_voronoi_sdf.reshape(1, -1), # Use the computed SDF for this iteration
+            scales=voronoi_scale[None]
+        )
+        end_points, end_sdf = verts_list[0]  # (N_verts, 2, 3) and (N_verts, 2, 1)
+        end_scales = scale_list[0]  # (N_verts, 2, 1)
 
-            norm_sdf = end_sdf.abs() / end_sdf.abs().sum(dim=1, keepdim=True)
-            verts = end_points[:, 0, :] * norm_sdf[:, 1, :] + end_points[:, 1, :] * norm_sdf[:, 0, :]
-            faces = faces_list[0]  # (N_faces, 3)
+        norm_sdf = end_sdf.abs() / end_sdf.abs().sum(dim=1, keepdim=True)
+        verts = end_points[:, 0, :] * norm_sdf[:, 1, :] + end_points[:, 1, :] * norm_sdf[:, 0, :]
+        faces = faces_list[0]  # (N_faces, 3)
 
         # --- Filtering ---
         # Frustum filtering
         faces_mask = is_in_view_frustum(verts, viewpoint_cam)[faces].any(axis=1)
         
-        # GOF filtering for large edges (marching-tets only; cband has no tet end-points)
-        if (not use_cband) and (config["filter_large_edges"] or config["collapse_large_edges"]):
+        # GOF filtering for large edges
+        if config["filter_large_edges"] or config["collapse_large_edges"]:
             dmtet_distance = torch.norm(end_points[:, 0, :] - end_points[:, 1, :], dim=-1)
             dmtet_scale = end_scales[:, 0, 0] + end_scales[:, 1, 0]
             dmtet_vertex_mask = (dmtet_distance <= dmtet_scale)
             
-        if (not use_cband) and config["filter_large_edges"]:
+        if config["filter_large_edges"]:
             dmtet_face_mask = dmtet_vertex_mask[faces].all(axis=1)
             faces_mask = faces_mask & dmtet_face_mask
 
-        if (not use_cband) and config["collapse_large_edges"]:
+        if config["collapse_large_edges"]:
             min_end_points = end_points[
                 np.arange(end_points.shape[0]), 
                 end_sdf.argmin(dim=1).flatten().cpu().numpy()

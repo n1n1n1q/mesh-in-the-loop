@@ -356,7 +356,7 @@ def training(
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and iteration != args.depth_reinit_iter:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune_mask(opt.densify_grad_threshold, 
+                    gaussians.densify_and_prune_mask(opt.densify_grad_threshold,
                                                     0.005, scene.cameras_extent, 
                                                     size_threshold, mask_blur)
                     mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')

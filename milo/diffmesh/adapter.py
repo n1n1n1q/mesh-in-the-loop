@@ -75,6 +75,7 @@ def extract_pivot_realness(
     if max_pivots is not None:
         downsample_ratio = min(float(max_pivots) / (per_gauss * n_gauss), 1.0)
 
+    scale = None
     if pivot_mode == "centers":
         xyz = gaussians.get_xyz.detach()
         pivot_imp = imp_score.detach().reshape(-1).float()
@@ -83,19 +84,21 @@ def extract_pivot_realness(
             xyz, pivot_imp = xyz[idx], pivot_imp[idx]
         pivots = xyz
     elif pivot_mode == "full":
-        pivots, _scale, pivot_imp = gaussians.get_tetra_points(
+        pivots, scale, pivot_imp = gaussians.get_tetra_points(
             downsample_ratio=downsample_ratio,
             let_gradients_flow=False,
             extra_gaussian_feature=imp_score,
         )
         pivot_imp = pivot_imp.reshape(-1).float()
+        scale = scale.reshape(-1).float()
 
     if psi_from == "rank":
         psi = rank(pivot_imp)
     elif psi_from == "raw":
         psi = pivot_imp
 
-    return pivots.contiguous(), psi, pivot_imp
+    # scale is the per-pivot Gaussian scale used by MILo's large-edge filter (None in centers mode).
+    return pivots.contiguous(), psi, pivot_imp, scale
 
 
 def dt_faces_from_points(points: torch.Tensor) -> torch.Tensor:
