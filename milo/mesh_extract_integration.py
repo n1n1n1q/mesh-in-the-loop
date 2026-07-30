@@ -182,7 +182,7 @@ def extract_mesh(
         if n_delaunay_sites < 0:
             n_delaunay_gaussians = None
         else:
-            n_delaunay_gaussians = n_delaunay_sites // 9
+            n_delaunay_gaussians = n_delaunay_sites // 2
         
         marching_tetrahedra_with_binary_search(
             model_path=dataset.model_path,

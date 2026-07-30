@@ -237,7 +237,7 @@ def compute_mesh_regularization(
                 else:
                     delaunay_sampling_radius_mask = None
 
-                n_max_gaussians_for_delaunay = int(config["n_max_points_in_delaunay"] / 9.)
+                n_max_gaussians_for_delaunay = int(config["n_max_points_in_delaunay"] / 2.)
                 downsample_gaussians_for_delaunay = n_max_gaussians_for_delaunay < n_gaussians_to_sample_from
 
                 if downsample_gaussians_for_delaunay:
@@ -371,11 +371,11 @@ def compute_mesh_regularization(
                 )  # Between -1 and 1
                 base_occupancy = convert_sdf_to_occupancy(base_occupancy)  # Between 0.005 and 0.995
                 
-                # Reshape base occupancy to make it (N_sampled_gaussians, 9)
+                # Reshape base occupancy to make it (N_sampled_gaussians, 2)
                 base_occupancy = unflatten_voronoi_features(
                     base_occupancy, 
-                    n_voronoi_per_gaussians=9
-                )  # (N_sampled_gaussians, 9)
+                    n_voronoi_per_gaussians=2
+                )  # (N_sampled_gaussians, 2)
                 
                 # Logic for resetting occupancy values
                 if config["learnable_sdf_reset_mode"] == "ema":
@@ -412,9 +412,9 @@ def compute_mesh_regularization(
         
         # Convert learnable occupancy values to SDF
         if delaunay_xyz_idx is not None:
-            current_occupancy = gaussians.get_occupancy[delaunay_xyz_idx]  # (N_sampled_gaussians, 9)
+            current_occupancy = gaussians.get_occupancy[delaunay_xyz_idx]  # (N_sampled_gaussians, 2)
         else:
-            current_occupancy = gaussians.get_occupancy  # (N_gaussians, 9)
+            current_occupancy = gaussians.get_occupancy  # (N_gaussians, 2)
         current_voronoi_sdf = convert_occupancy_to_sdf(
             flatten_voronoi_features(current_occupancy)
         )  # (N_voronoi_points, )
@@ -563,7 +563,7 @@ def compute_mesh_regularization(
         if config["enforce_occupied_centers"]:
             # Get sdf values for centers of sampled Gaussians
             if mesh_state["surface_delaunay_xyz_idx"] is not None:
-                gaussians_occupancy = gaussians.get_occupancy[mesh_state["surface_delaunay_xyz_idx"]]  # (N_surface_gaussians, 9)
+                gaussians_occupancy = gaussians.get_occupancy[mesh_state["surface_delaunay_xyz_idx"]]  # (N_surface_gaussians, 2)
                 gaussians_occupancy = gaussians_occupancy[:, -1]  # (N_surface_gaussians, )
             else:
                 gaussians_occupancy = current_occupancy[:, -1]

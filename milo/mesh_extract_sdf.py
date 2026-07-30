@@ -80,7 +80,7 @@ def extract_mesh_with_sdf_refinement(
 
     with torch.no_grad():
         n_gaussians_to_sample_from = gaussians._xyz.shape[0]
-        n_max_gaussians_for_delaunay = int(n_max_points_in_delaunay / 9.)
+        n_max_gaussians_for_delaunay = int(n_max_points_in_delaunay / 2.)
         downsample_gaussians_for_delaunay = n_max_gaussians_for_delaunay < n_gaussians_to_sample_from
 
         if downsample_gaussians_for_delaunay:            
@@ -184,11 +184,11 @@ def extract_mesh_with_sdf_refinement(
             )  # Between -1 and 1
             base_occupancy = convert_sdf_to_occupancy(base_occupancy)  # Between 0.005 and 0.995
             
-            # Reshape base occupancy to make it (N_sampled_gaussians, 9)
+            # Reshape base occupancy to make it (N_sampled_gaussians, 2)
             base_occupancy = unflatten_voronoi_features(
                 base_occupancy, 
-                n_voronoi_per_gaussians=9
-            )  # (N_sampled_gaussians, 9)
+                n_voronoi_per_gaussians=2
+            )  # (N_sampled_gaussians, 2)
             
             # Reset occupancy
             gaussians.reset_occupancy(
@@ -242,9 +242,9 @@ def extract_mesh_with_sdf_refinement(
         # --- Extract the Mesh ---
         # Compute the SDF
         if delaunay_xyz_idx is not None:
-            current_occupancy = gaussians.get_occupancy[delaunay_xyz_idx]  # (N_sampled_gaussians, 9)
+            current_occupancy = gaussians.get_occupancy[delaunay_xyz_idx]  # (N_sampled_gaussians, 2)
         else:
-            current_occupancy = gaussians.get_occupancy  # (N_gaussians, 9)
+            current_occupancy = gaussians.get_occupancy  # (N_gaussians, 2)
         current_voronoi_sdf = convert_occupancy_to_sdf(
                 flatten_voronoi_features(current_occupancy)
             )  # (N_voronoi_points, )
@@ -455,9 +455,9 @@ def extract_mesh_with_sdf_refinement(
     with torch.no_grad():
         # Compute the SDF
         if delaunay_xyz_idx is not None:
-            current_occupancy = gaussians.get_occupancy[delaunay_xyz_idx]  # (N_sampled_gaussians, 9)
+            current_occupancy = gaussians.get_occupancy[delaunay_xyz_idx]  # (N_sampled_gaussians, 2)
         else:
-            current_occupancy = gaussians.get_occupancy  # (N_gaussians, 9)
+            current_occupancy = gaussians.get_occupancy  # (N_gaussians, 2)
         current_voronoi_sdf = convert_occupancy_to_sdf(
                 flatten_voronoi_features(current_occupancy)
             )  # (N_voronoi_points, )

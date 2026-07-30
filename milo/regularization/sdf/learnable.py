@@ -77,7 +77,7 @@ def linearize_sdf_values(
         verts (torch.Tensor): The vertices. (N_verts, 3)
         
     Returns:
-        sdf_values (torch.Tensor): The linearized SDF values. (N_voronoi, 9)
+        sdf_values (torch.Tensor): The linearized SDF values. (N_voronoi, 2)
     """
     
     shifts = (end_points[:, 0, :] - end_points[:, 1, :]).norm(dim=-1).clamp(min=min_shift_length)  # (N_verts, )

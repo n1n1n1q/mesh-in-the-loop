@@ -23,7 +23,6 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.appearance_network import AppearanceNetwork
 from utils.sh_utils import SH2RGB
-import trimesh
 
 try:
     from diff_gaussian_rasterization_ms import SparseGaussianAdam
@@ -283,11 +282,11 @@ class GaussianModel:
             # If using occupancy shift
             if self._occupancy_mode == "occupancy_shift":
                 if gaussian_idx is None:
-                    self._base_occupancy[...] = inverse_sigmoid(base_occupancy)  # (N_gaussians, 9)
+                    self._base_occupancy[...] = inverse_sigmoid(base_occupancy)  # (N_gaussians, 2)
                     if occupancy is not None:
                         self._occupancy_shift[...] = inverse_sigmoid(occupancy) - self._base_occupancy
                 else:
-                    self._base_occupancy[gaussian_idx] = inverse_sigmoid(base_occupancy)  # (N_valid_gaussians, 9)
+                    self._base_occupancy[gaussian_idx] = inverse_sigmoid(base_occupancy)  # (N_valid_gaussians, 2)
                     if occupancy is not None:
                         self._occupancy_shift[gaussian_idx] = inverse_sigmoid(occupancy) - self._base_occupancy[gaussian_idx]
             
@@ -402,8 +401,8 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
             
         if self.learn_occupancy:
-            base_occupancy = torch.zeros((self._xyz.shape[0], 9), device="cuda")
-            occupancy_shift = torch.zeros((self._xyz.shape[0], 9), device="cuda")
+            base_occupancy = torch.zeros((self._xyz.shape[0], 2), device="cuda")
+            occupancy_shift = torch.zeros((self._xyz.shape[0], 2), device="cuda")
             self._base_occupancy = nn.Parameter(base_occupancy.requires_grad_(False), requires_grad=False)  # Do not learn base occupancy
             self._occupancy_shift = nn.Parameter(occupancy_shift.requires_grad_(True))  # Learn occupancy shift
         
@@ -443,9 +442,6 @@ class GaussianModel:
             vertices_scale (torch.Tensor): The scale of the vertices.
             sdf_values (torch.Tensor, optional): The SDF values of the tetra points.
         """
-        M = trimesh.creation.box()
-        M.vertices *= 2
-        
         use_downsample_ratio = (downsample_ratio is not None) and (downsample_ratio < 1.0)
         use_xyz_idx = xyz_idx is not None
         if verbose:
@@ -504,21 +500,24 @@ class GaussianModel:
             if return_sdf_values:
                 sdf_values = sdf_values[xyz_idx]
             if verbose:
-                print(f"[INFO] Number of tetra points after downsampling: {xyz.shape[0] * 9}.")
-        
-        vertices = M.vertices.T    
-        vertices = torch.from_numpy(vertices).float().cuda().unsqueeze(0).repeat(xyz.shape[0], 1, 1)
-        # scale vertices first
-        vertices = vertices * scale.unsqueeze(-1)
-        vertices = torch.bmm(rots, vertices).squeeze(-1) + xyz.unsqueeze(-1)
-        vertices = vertices.permute(0, 2, 1).reshape(-1, 3).contiguous()
-        # concat center points
-        vertices = torch.cat([vertices, xyz], dim=0)
-        
+                print(f"[INFO] Number of tetra points after downsampling: {xyz.shape[0] * 2}.")
+
+        # The normal of a Gaussian is the axis of its covariance with the smallest scale.
+        normal_idx = scale.min(dim=-1, keepdim=True)[1]  # (N, 1)
+        normal = torch.gather(
+            rots, dim=2, index=normal_idx[:, :, None].repeat(1, 3, 1)
+        ).squeeze(-1)  # (N, 3)
+        normal_scale = torch.gather(scale, dim=-1, index=normal_idx)  # (N, 1)
+
+        # Second point: offset from the center along the normal direction
+        offset_vertices = xyz + normal * normal_scale
+
+        # Concatenate center points and offset points
+        vertices = torch.cat([xyz, offset_vertices], dim=0)
+
         # scale is not a good solution but use it for now
         scale = scale.max(dim=-1, keepdim=True)[0]
-        scale_corner = scale.repeat(1, 8).reshape(-1, 1)
-        vertices_scale = torch.cat([scale_corner, scale], dim=0)
+        vertices_scale = torch.cat([scale, scale], dim=0)
         
         if return_sdf_values:
             return vertices, vertices_scale, sdf_values
@@ -1046,8 +1045,8 @@ class GaussianModel:
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
             
         if self.learn_occupancy:
-            base_occupancy = torch.zeros((fused_point_cloud.shape[0], 9), dtype=torch.float, device="cuda")
-            occupancy_shift = torch.zeros((fused_point_cloud.shape[0], 9), dtype=torch.float, device="cuda")
+            base_occupancy = torch.zeros((fused_point_cloud.shape[0], 2), dtype=torch.float, device="cuda")
+            occupancy_shift = torch.zeros((fused_point_cloud.shape[0], 2), dtype=torch.float, device="cuda")
 
         self._xyz = nn.Parameter(fused_point_cloud.contiguous().requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))

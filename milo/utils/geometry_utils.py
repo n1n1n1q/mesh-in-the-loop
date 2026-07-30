@@ -208,7 +208,7 @@ def is_in_view_frustum(
     return valid_mask
 
 
-def unflatten_voronoi_features(voronoi_features:torch.Tensor, n_voronoi_per_gaussians:int=9):
+def unflatten_voronoi_features(voronoi_features:torch.Tensor, n_voronoi_per_gaussians:int=2):
     """Unflatten the voronoi features into a 3D tensor with shape (n_gaussians, n_voronoi_per_gaussians, *voronoi_features.shape[1:]).
 
     Args:
@@ -227,7 +227,7 @@ def unflatten_voronoi_features(voronoi_features:torch.Tensor, n_voronoi_per_gaus
     ).reshape(n_gaussians, n_voronoi_per_gaussians, *voronoi_features.shape[1:])
     
     
-def flatten_voronoi_features(voronoi_features:torch.Tensor, n_voronoi_per_gaussians:int=9):
+def flatten_voronoi_features(voronoi_features:torch.Tensor, n_voronoi_per_gaussians:int=2):
     return torch.cat(
         [
             voronoi_features[:, :n_voronoi_per_gaussians-1].reshape(-1, *voronoi_features.shape[2:]),

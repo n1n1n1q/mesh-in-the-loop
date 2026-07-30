@@ -7,7 +7,6 @@
 from typing import List, Union, Tuple
 import numpy as np
 import torch
-import trimesh
 from scene.cameras import Camera
 from utils.general_utils import build_rotation
 from functional.func_utils import _init_cdf_mask, _render_simp
@@ -184,7 +183,9 @@ def extract_gaussian_pivots(
     scale_pivots_factor:float=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Extract pivots from Gaussians, in a differentiable manner.
-    Each Gaussian will spawn 9 pivots.
+    Each Gaussian will spawn 2 pivots: its center, and a point offset from the
+    center along the Gaussian's normal (the shortest axis of its covariance)
+    by 3 times the scale along that axis.
     A list of indices can be provided to generate pivots only for a subset of Gaussians.
     We recommend to use only Gaussians that are located on or near the surface;
     indices of such Gaussians can be obtained by calling sample_gaussians_on_surface(...).
@@ -193,27 +194,24 @@ def extract_gaussian_pivots(
         means (torch.Tensor): Means of the Gaussians. Shape: (N, 3).
         scales (torch.Tensor): Scales of the Gaussians. Shape: (N, 3).
         rotations (torch.Tensor): Rotations of the Gaussians as quaternions. Shape: (N, 4).
-        gaussian_idx (Union[torch.Tensor, None], optional): Indices of the Gaussians to be used for generating pivots. 
+        gaussian_idx (Union[torch.Tensor, None], optional): Indices of the Gaussians to be used for generating pivots.
             Shape: (N_selected,). Defaults to None.
         scale_pivots_with_downsample_ratio (bool, optional): If True, the scale of the pivots will be adjusted to match the downsample ratio. Defaults to True.
         scale_pivots_factor (float, optional): If provided, the scale of the pivots will be multiplied by this factor. Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Pivots and their scales.
-            Pivots: Shape: (9*N_selected, 3).
-            Pivots_scale: Shape: (9*N_selected, 1).
+            Pivots: Shape: (2*N_selected, 3).
+            Pivots_scale: Shape: (2*N_selected, 1).
     """
-    M = trimesh.creation.box()
-    M.vertices *= 2
-        
     xyz = means.clone()
     scale = scales.clone() * 3.
     rots = build_rotation(rotations.clone())
-    
+
     if gaussian_idx is not None:
         # Compute downsample ratio between the total number of Gaussians
         # and the number of Gaussians to be used for generating pivots.
-        downsample_ratio = gaussian_idx.shape[0] / xyz.shape[0]    
+        downsample_ratio = gaussian_idx.shape[0] / xyz.shape[0]
 
         # Select the Gaussians to be used for generating pivots.
         xyz = xyz[gaussian_idx]
@@ -225,21 +223,22 @@ def extract_gaussian_pivots(
             scale = scale / (downsample_ratio ** (1/3))
         elif scale_pivots_factor is not None:
             scale = scale * scale_pivots_factor
-    
-    pivots = M.vertices.T    
-    pivots = torch.from_numpy(pivots).float().cuda().unsqueeze(0).repeat(xyz.shape[0], 1, 1)
-    
-    # Reparameterization trick
-    pivots = pivots * scale.unsqueeze(-1)
-    pivots = torch.bmm(rots, pivots).squeeze(-1) + xyz.unsqueeze(-1)
-    pivots = pivots.permute(0, 2, 1).reshape(-1, 3).contiguous()
-    
-    # Concatenate center points
-    pivots = torch.cat([pivots, xyz], dim=0)
-    
+
+    # The normal of a Gaussian is the axis of its covariance with the smallest scale.
+    normal_idx = scale.min(dim=-1, keepdim=True)[1]  # (N, 1)
+    normal = torch.gather(
+        rots, dim=2, index=normal_idx[:, :, None].repeat(1, 3, 1)
+    ).squeeze(-1)  # (N, 3)
+    normal_scale = torch.gather(scale, dim=-1, index=normal_idx)  # (N, 1)
+
+    # Second pivot: offset from the center along the normal direction
+    offset_pivots = xyz + normal * normal_scale
+
+    # Concatenate center points and offset points
+    pivots = torch.cat([xyz, offset_pivots], dim=0)
+
     # Scale is not a good solution but use it for now
     scale = scale.max(dim=-1, keepdim=True)[0]
-    scale_corner = scale.repeat(1, 8).reshape(-1, 1)
-    pivots_scale = torch.cat([scale_corner, scale], dim=0)
-    
+    pivots_scale = torch.cat([scale, scale], dim=0)
+
     return pivots, pivots_scale
