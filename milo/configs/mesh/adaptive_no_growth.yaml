@@ -1,0 +1,90 @@
+# Ablation of adaptive.yaml: freezes the pivot budget at the same fixed count
+# baseline uses (n_max_points_in_delaunay / pivot_budget_max, both 5.4M), so the
+# only difference from baseline.yaml's mesh-phase behavior is the erosion fix
+# (residual-weighted hinge + hard reseed + anti-saturation) -- isolating whether
+# the elevated screen-space residual seen on Truck_adaptive (see
+# residual_diagnostic.py findings) comes from the erosion-fix mechanism itself or
+# from the 3x pivot growth. pivot_budget_init == pivot_budget_max means
+# compute_adaptive_pivot_budget() never actually grows the budget past its first
+# value, so this is budget-matched to baseline, not just growth-disabled.
+
+# Regularization schedule
+start_iter: 8_001
+mesh_update_interval: 1
+stop_iter: 18000
+
+# Depth loss weight
+use_depth_loss: true
+depth_weight: 0.05
+depth_ratio: 1.0
+mesh_depth_loss_type: "log"
+
+# Normal loss weight
+use_normal_loss: true
+normal_weight: 0.05
+use_depth_normal: true
+
+# Delaunay computation
+delaunay_reset_interval: 500
+n_max_points_in_delaunay: 5_400_000  # Used as fallback if adaptive_pivots is false
+delaunay_sampling_method: "surface"
+filter_large_edges: true
+collapse_large_edges: false
+
+# --- Adaptive pivot growth (disabled: init == max) ---
+adaptive_pivots: true
+pivot_budget_init: 5_400_000   # was: 1_800_000 -- budget-matched to baseline from iter 1
+pivot_budget_max: 5_400_000
+pivot_growth_interval: 500
+pivot_growth_factor: 1.35      # inert: budget is already at max
+pivot_freeze_last_iters: 3000
+
+# Rasterization
+use_scalable_renderer: true
+
+# SDF computation
+sdf_reset_interval: 500
+sdf_default_isosurface: 0.5
+transform_sdf_to_linear_space: false
+min_occupancy_value: 0.0000000001
+
+#   > For Integrate
+use_ema: true
+alpha_ema: 0.4
+
+#   > For TSDF
+trunc_margin: 0.002
+
+#   > For learnable
+occupancy_mode: "occupancy_shift"
+#       > Gaussian centers regularization
+enforce_occupied_centers: true
+occupied_centers_weight: 0.005
+#       > Occupancy labels loss
+use_occupancy_labels_loss: true
+reset_occupancy_labels_every: 200
+occupancy_labels_loss_weight: 0.005
+#       > SDF reset
+fix_set_of_learnable_sdfs: true  # Ignored: adaptive_pivots overrides the freeze logic
+learnable_sdf_reset_mode: "ema"
+learnable_sdf_reset_stop_iter: 15001
+learnable_sdf_reset_alpha_ema: 0.4
+
+method_to_reset_sdf: "depth_fusion"
+n_binary_steps_to_reset_sdf: 0
+sdf_reset_linearization_n_steps: 20
+sdf_reset_linearization_enforce_std: 0.5
+depth_fusion_reset_tolerance: 0.1
+
+# --- Erosion fix (unchanged from adaptive.yaml) ---
+use_adaptive_erosion_fix: true
+erosion_occupancy_threshold: 0.9
+erosion_residual_threshold: 1.5
+erosion_residual_weight_clip: 5.0
+erosion_hard_reseed_alpha: 1.0
+use_erosion_anti_saturation: true
+erosion_anti_saturation_weight: 0.001
+erosion_anti_saturation_margin: 4.0
+
+# Foreground Culling
+radius_culling: -1.0

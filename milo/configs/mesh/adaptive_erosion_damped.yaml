@@ -1,0 +1,92 @@
+# Ablation of adaptive.yaml: damps the erosion-fix's hard-reseed trigger to test
+# whether it is the source of the elevated screen-space residual observed on Truck
+# (residual_diagnostic.py showed Truck_adaptive's final mesh disagrees with the
+# Gaussian render *more* than baseline's, despite having 2.6x more triangles --
+# suggesting the hard reseed is chasing a noisy local residual signal instead of
+# converging). Only the two "--- Erosion fix ---" values below differ from
+# adaptive.yaml: the residual-weight clip is lowered (5.0 -> 2.0, so a single noisy
+# high-residual Gaussian can't dominate the hinge as much) and the reseed is a
+# partial EMA blend (1.0 -> 0.5) instead of a full hard replace, so a false-positive
+# "eroded" classification doesn't fully overwrite the learned SDF in one step.
+# Everything else, including pivot growth, is unchanged from adaptive.yaml.
+
+# Regularization schedule
+start_iter: 8_001
+mesh_update_interval: 1
+stop_iter: 18000
+
+# Depth loss weight
+use_depth_loss: true
+depth_weight: 0.05
+depth_ratio: 1.0
+mesh_depth_loss_type: "log"
+
+# Normal loss weight
+use_normal_loss: true
+normal_weight: 0.05
+use_depth_normal: true
+
+# Delaunay computation
+delaunay_reset_interval: 500
+n_max_points_in_delaunay: 5_400_000  # Used as fallback if adaptive_pivots is false
+delaunay_sampling_method: "surface"
+filter_large_edges: true
+collapse_large_edges: false
+
+# --- Adaptive pivot growth ---
+adaptive_pivots: true
+pivot_budget_init: 1_800_000
+pivot_budget_max: 5_400_000
+pivot_growth_interval: 500
+pivot_growth_factor: 1.35
+pivot_freeze_last_iters: 3000
+
+# Rasterization
+use_scalable_renderer: true
+
+# SDF computation
+sdf_reset_interval: 500
+sdf_default_isosurface: 0.5
+transform_sdf_to_linear_space: false
+min_occupancy_value: 0.0000000001
+
+#   > For Integrate
+use_ema: true
+alpha_ema: 0.4
+
+#   > For TSDF
+trunc_margin: 0.002
+
+#   > For learnable
+occupancy_mode: "occupancy_shift"
+#       > Gaussian centers regularization
+enforce_occupied_centers: true
+occupied_centers_weight: 0.005
+#       > Occupancy labels loss
+use_occupancy_labels_loss: true
+reset_occupancy_labels_every: 200
+occupancy_labels_loss_weight: 0.005
+#       > SDF reset
+fix_set_of_learnable_sdfs: true  # Ignored: adaptive_pivots overrides the freeze logic
+learnable_sdf_reset_mode: "ema"
+learnable_sdf_reset_stop_iter: 15001
+learnable_sdf_reset_alpha_ema: 0.4
+
+method_to_reset_sdf: "depth_fusion"
+n_binary_steps_to_reset_sdf: 0
+sdf_reset_linearization_n_steps: 20
+sdf_reset_linearization_enforce_std: 0.5
+depth_fusion_reset_tolerance: 0.1
+
+# --- Erosion fix (damped) ---
+use_adaptive_erosion_fix: true
+erosion_occupancy_threshold: 0.9
+erosion_residual_threshold: 1.5
+erosion_residual_weight_clip: 2.0     # was: 5.0
+erosion_hard_reseed_alpha: 0.5        # was: 1.0 (full hard reseed)
+use_erosion_anti_saturation: true
+erosion_anti_saturation_weight: 0.001
+erosion_anti_saturation_margin: 4.0
+
+# Foreground Culling
+radius_culling: -1.0

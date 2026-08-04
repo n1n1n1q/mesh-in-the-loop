@@ -114,6 +114,12 @@ class GaussianModel:
             self.xyz_gradient_accum_abs = torch.empty(0)
             self.xyz_gradient_accum_abs_max = torch.empty(0)
 
+        # Dedicated accumulators for adaptive densification during the mesh-in-the-loop
+        # phase, kept separate from xyz_gradient_accum/denom (used only pre-densify_until_iter)
+        # so the two densification stages never interfere with each other.
+        self.mesh_xyz_gradient_accum = torch.empty(0)
+        self.mesh_denom = torch.empty(0)
+
     def capture(self):
         to_return = (
             self.active_sh_degree,
@@ -888,7 +894,38 @@ class GaussianModel:
 
     def add_densification_stats_culling(self, viewspace_point_tensor, update_filter, factor):
         self.xyz_gradient_accum[update_filter] += (torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)*factor[update_filter])
-        self.denom[update_filter] += 1        
+        self.denom[update_filter] += 1
+
+    def init_mesh_densification_stats(self):
+        self.mesh_xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.mesh_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+
+    def add_mesh_densification_stats(self, viewspace_point_tensor, update_filter):
+        self.mesh_xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        self.mesh_denom[update_filter] += 1
+
+    def densify_and_prune_mesh_phase(self, max_grad, min_opacity, extent, max_screen_size):
+        """
+        Same as densify_and_prune, but driven by gradients accumulated during the
+        mesh-in-the-loop phase (mesh_xyz_gradient_accum/mesh_denom) instead of the
+        standard pre-densify_until_iter accumulators. Gaussians the mesh depth/normal
+        losses push the hardest -- i.e. where the mesh disagrees the most with the
+        Gaussian volumetric render -- are the ones cloned/split.
+        """
+        grads = self.mesh_xyz_gradient_accum / self.mesh_denom
+        grads[grads.isnan()] = 0.0
+
+        self.densify_and_clone(grads, max_grad, extent)
+        self.densify_and_split(grads, max_grad, extent)
+
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        self.prune_points(prune_mask)
+
+        torch.cuda.empty_cache()
 
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):

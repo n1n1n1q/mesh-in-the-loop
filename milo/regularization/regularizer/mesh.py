@@ -29,6 +29,14 @@ from utils.geometry_utils import (
     unflatten_voronoi_features,
     flatten_voronoi_features,
 )
+from regularization.regularizer.adaptive import (
+    compute_screen_space_residual,
+    compute_adaptive_pivot_budget,
+    compute_erosion_loss,
+    compute_erosion_reseed_alpha,
+    compute_anti_saturation_loss,
+    compute_erosion_anneal_scale,
+)
 
 # Try importing cpp extension, handle potential ImportError
 try:
@@ -169,9 +177,17 @@ def compute_mesh_regularization(
         if iteration % config["sdf_reset_interval"] == 0:
             reset_sdf_values = True
         
-        if config["fix_set_of_learnable_sdfs"] and (iteration > config["start_iter"]):
+        if config.get("adaptive_pivots", False):
+            # Instead of freezing the pivot set right after start_iter, keep resampling
+            # (with a growing budget, see compute_adaptive_pivot_budget) so newly
+            # densified Gaussians in high-residual regions can become pivots, and only
+            # freeze for a short fine-tuning tail before stop_iter.
+            freeze_from_iter = config["stop_iter"] - config.get("pivot_freeze_last_iters", 0)
+            if (iteration > config["start_iter"]) and (iteration >= freeze_from_iter):
+                reset_delaunay_samples = False
+        elif config["fix_set_of_learnable_sdfs"] and (iteration > config["start_iter"]):
             reset_delaunay_samples = False
-            
+
         if (config["learnable_sdf_reset_mode"] == "none")  and (iteration > config["start_iter"]):
             reset_sdf_values = False  # TODO: Maybe not needed?
         
@@ -237,7 +253,11 @@ def compute_mesh_regularization(
                 else:
                     delaunay_sampling_radius_mask = None
 
-                n_max_gaussians_for_delaunay = int(config["n_max_points_in_delaunay"] / 9.)
+                if config.get("adaptive_pivots", False):
+                    n_max_points_in_delaunay = compute_adaptive_pivot_budget(iteration, config)
+                else:
+                    n_max_points_in_delaunay = config["n_max_points_in_delaunay"]
+                n_max_gaussians_for_delaunay = int(n_max_points_in_delaunay / 9.)
                 downsample_gaussians_for_delaunay = n_max_gaussians_for_delaunay < n_gaussians_to_sample_from
 
                 if downsample_gaussians_for_delaunay:
@@ -287,7 +307,6 @@ def compute_mesh_regularization(
                     else:
                         raise ValueError(f"Invalid Delaunay sampling method: {config['delaunay_sampling_method']}")
                     print(f"[INFO] Downsampled Delaunay Gaussians from {n_gaussians_to_sample_from} to {len(delaunay_xyz_idx)}.")
-                    reset_occupancy_labels_for_new_delaunay_sites = True
                 else:
                     if delaunay_sampling_radius_mask is not None:
                         delaunay_xyz_idx = torch.where(delaunay_sampling_radius_mask)[0]
@@ -295,6 +314,14 @@ def compute_mesh_regularization(
                     else:
                         delaunay_xyz_idx = None
                         print(f"[INFO] No need to downsample Delaunay Gaussians.")
+
+                # The set of Delaunay sites (and therefore voronoi_points) may have changed
+                # identity in any of the branches above -- not just when downsampling kicks
+                # in -- e.g. when adaptive Gaussian densification grows the population past
+                # n_max_gaussians_for_delaunay, delaunay_xyz_idx flips from a fixed subset to
+                # None (all Gaussians). Stale voronoi_occupancy_labels (sized to the old site
+                # set) would otherwise cause a shape mismatch in the occupancy labels loss.
+                reset_occupancy_labels_for_new_delaunay_sites = True
 
                 torch.cuda.empty_cache()
                 reset_delaunay_samples = False # Reset flag after computation
@@ -384,6 +411,14 @@ def compute_mesh_regularization(
                     _n_voronoi = base_occupancy.view(-1).shape[0]
                     print(f"          > Number of points to reset with EMA: {_n_ema}/{_n_voronoi}")
                     sdf_alpha_ema = config["learnable_sdf_reset_alpha_ema"]
+                    if config.get("use_adaptive_erosion_fix", False):
+                        sdf_alpha_ema = compute_erosion_reseed_alpha(
+                            previous_occupancy=gaussians.get_occupancy[delaunay_xyz_idx],
+                            gaussian_idx=delaunay_xyz_idx,
+                            gaussians=gaussians,
+                            config=config,
+                            default_alpha=sdf_alpha_ema,
+                        )
                     new_occupancy =  torch.where(
                         gaussians._base_occupancy[delaunay_xyz_idx] != 0.,  # Points that have been sampled before
                         (sdf_alpha_ema * base_occupancy 
@@ -561,13 +596,49 @@ def compute_mesh_regularization(
             
         # Enforce occupied centers
         if config["enforce_occupied_centers"]:
-            # Get sdf values for centers of sampled Gaussians
-            if mesh_state["surface_delaunay_xyz_idx"] is not None:
-                gaussians_occupancy = gaussians.get_occupancy[mesh_state["surface_delaunay_xyz_idx"]]  # (N_surface_gaussians, 9)
-                gaussians_occupancy = gaussians_occupancy[:, -1]  # (N_surface_gaussians, )
+            if config.get("use_adaptive_erosion_fix", False):
+                # Residual-weighted erosion hinge, concentrated on Gaussians where the
+                # mesh currently disagrees the most with the Gaussian render (see
+                # regularization/regularizer/adaptive.py). By default this applies to
+                # all 9 pivots of every sampled Gaussian; erosion_hinge_center_only
+                # restricts it to the center pivot only (matching the non-erosion-fix
+                # branch below), since pulling all 9 -- including the 8 tetrahedral
+                # corners, which sit past where the true surface usually is -- can
+                # inflate the mesh outward diffusely and hurt precision (see the
+                # Truck ablation results this flag was added to test).
+                hinge_occupancy = (
+                    current_occupancy[:, -1:] if config.get("erosion_hinge_center_only", False)
+                    else current_occupancy
+                )
+                occupied_centers_loss = compute_erosion_loss(
+                    current_occupancy=hinge_occupancy,
+                    gaussian_idx=delaunay_xyz_idx,
+                    gaussians=gaussians,
+                    config=config,
+                )
+                # Decay the hinge to 0 over the final erosion_anneal_last_iters iterations
+                # (no-op unless that key is set; see compute_erosion_anneal_scale).
+                occupied_centers_loss = occupied_centers_loss * compute_erosion_anneal_scale(iteration, config)
+                if config.get("use_erosion_anti_saturation", False):
+                    occupancy_shift_sampled = (
+                        gaussians._occupancy_shift[delaunay_xyz_idx]
+                        if delaunay_xyz_idx is not None
+                        else gaussians._occupancy_shift
+                    )
+                    occupied_centers_loss = occupied_centers_loss + compute_anti_saturation_loss(
+                        occupancy_shift=occupancy_shift_sampled,
+                        gaussian_idx=delaunay_xyz_idx,
+                        gaussians=gaussians,
+                        config=config,
+                    )
             else:
-                gaussians_occupancy = current_occupancy[:, -1]
-            occupied_centers_loss = config["occupied_centers_weight"] * (config["sdf_default_isosurface"] - gaussians_occupancy).clamp(min=0.).mean()
+                # Get sdf values for centers of sampled Gaussians
+                if mesh_state["surface_delaunay_xyz_idx"] is not None:
+                    gaussians_occupancy = gaussians.get_occupancy[mesh_state["surface_delaunay_xyz_idx"]]  # (N_surface_gaussians, 9)
+                    gaussians_occupancy = gaussians_occupancy[:, -1]  # (N_surface_gaussians, )
+                else:
+                    gaussians_occupancy = current_occupancy[:, -1]
+                occupied_centers_loss = config["occupied_centers_weight"] * (config["sdf_default_isosurface"] - gaussians_occupancy).clamp(min=0.).mean()
         else:
             occupied_centers_loss = torch.zeros(size=(), device=gaussians._xyz.device)
             
@@ -585,6 +656,19 @@ def compute_mesh_regularization(
             occupancy_labels_loss = occupancy_labels_loss.mean()
         else:
             occupancy_labels_loss = torch.zeros(size=(), device=gaussians._xyz.device)
+
+        # Screen-space residual signal 
+        if config["use_depth_loss"] and config["use_normal_loss"]:
+            residual_scalar = compute_screen_space_residual(
+                mesh_depth=mesh_depth,
+                gaussians_depth=gaussians_depth,
+                mesh_normal_view=mesh_normal_view,
+                gaussians_normal_view=gaussians_normal_view,
+                rasterization_mask=rasterization_mask,
+                spatial_lr_scale=gaussians.spatial_lr_scale,
+            ).mean().detach()
+        else:
+            residual_scalar = torch.zeros(size=(), device=gaussians._xyz.device)
 
     # --- Return Results ---
     total_mesh_loss = (
@@ -611,6 +695,7 @@ def compute_mesh_regularization(
         "mesh_normal_loss": mesh_normal_loss.detach(),
         "occupied_centers_loss": occupied_centers_loss.detach(),
         "occupancy_labels_loss": occupancy_labels_loss.detach(),
+        "residual": residual_scalar,
         "updated_state": mesh_state,
         "mesh_render_pkg": {
             "depth": mesh_depth,

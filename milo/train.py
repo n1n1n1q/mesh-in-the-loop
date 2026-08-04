@@ -303,6 +303,7 @@ def training(
             mesh_normal_loss = mesh_regularization_pkg["mesh_normal_loss"]
             occupied_centers_loss = mesh_regularization_pkg["occupied_centers_loss"]
             occupancy_labels_loss = mesh_regularization_pkg["occupancy_labels_loss"]
+            mesh_residual = mesh_regularization_pkg["residual"]
             mesh_state = mesh_regularization_pkg["updated_state"]
             mesh_render_pkg = mesh_regularization_pkg["mesh_render_pkg"]
             
@@ -408,6 +409,40 @@ def training(
                                 iteration, args.warn_until_iter, scale=1.0, scale2=2.0
                             ).copy()
                         )
+
+            # ---Adaptive Gaussian densification during mesh-in-the-loop regularization---
+            # Standard densification stops at opt.densify_until_iter (well before the mesh
+            # phase starts). Here we accumulate gradients from the mesh depth/normal loss
+            # backward pass (which already flows through render_pkg into viewspace_point_tensor)
+            # and periodically clone/split Gaussians where the mesh disagrees the most with
+            # the Gaussian render, i.e. where the screen-space residual is high.
+            if (
+                mesh_kick_on and args.adaptive_gaussians
+                and (iteration >= args.adaptive_densify_from_iter)
+                and (iteration < args.adaptive_densify_until_iter)
+            ):
+                if gaussians.mesh_xyz_gradient_accum.shape[0] != gaussians._xyz.shape[0]:
+                    gaussians.init_mesh_densification_stats()
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                gaussians.add_mesh_densification_stats(viewspace_point_tensor, visibility_filter)
+
+                if iteration % args.adaptive_densify_interval == 0:
+                    n_before = gaussians._xyz.shape[0]
+                    gaussians.densify_and_prune_mesh_phase(
+                        args.adaptive_densify_grad_threshold,
+                        args.adaptive_densify_min_opacity,
+                        scene.cameras_extent,
+                        None,
+                    )
+                    print(
+                        f"[INFO] Adaptive densification at iteration {iteration}: "
+                        f"{n_before} -> {gaussians._xyz.shape[0]} Gaussians "
+                        f"(mean residual: {mesh_residual.item():.5f})"
+                    )
+                    gaussians.init_mesh_densification_stats()
+                    gaussians_have_changed = True
+                    if use_mip_filter:
+                        gaussians.compute_3D_filter(cameras=scene.getTrainCameras().copy())
 
             # ---Pruning and simplification---
             if iteration == args.simp_iteration1:
@@ -546,6 +581,16 @@ if __name__ == "__main__":
     parser.add_argument("--dense_gaussians", action="store_true")
     parser.add_argument("--detach_gaussian_rendering", action="store_true")
 
+    # ----- Adaptive Gaussian densification during mesh regularization -----
+    # > Off by default: baseline behavior (MILo's fixed pivot set / no post-8000 densification)
+    # > is unchanged unless explicitly requested.
+    parser.add_argument("--adaptive_gaussians", action="store_true")
+    parser.add_argument("--adaptive_densify_from_iter", type=int, default=None)
+    parser.add_argument("--adaptive_densify_until_iter", type=int, default=None)
+    parser.add_argument("--adaptive_densify_interval", type=int, default=500)
+    parser.add_argument("--adaptive_densify_grad_threshold", type=float, default=0.0002)
+    parser.add_argument("--adaptive_densify_min_opacity", type=float, default=0.005)
+
     # ----- Densification and Simplification -----
     # > Inspired by Mini-Splatting2.
     # > Used for pruning, densification and Gaussian pivots selection.
@@ -618,6 +663,18 @@ if __name__ == "__main__":
         with open(mesh_config_file, "r") as f:
             mesh_config = yaml.safe_load(f)
         print(f"[INFO] Using mesh regularization with config: {args.mesh_config}")
+
+        # Resolve adaptive densification schedule defaults from the mesh config:
+        # start right when mesh regularization kicks in, stop before the final
+        # fine-tuning tail (matching pivot_freeze_last_iters when adaptive pivots are used).
+        if args.adaptive_gaussians:
+            if args.adaptive_densify_from_iter is None:
+                args.adaptive_densify_from_iter = mesh_config["start_iter"]
+            if args.adaptive_densify_until_iter is None:
+                freeze_tail = mesh_config.get("pivot_freeze_last_iters", 0)
+                args.adaptive_densify_until_iter = mesh_config["stop_iter"] - freeze_tail
+            print(f"[INFO] Using adaptive Gaussian densification during mesh regularization.")
+            print(f"          > From iteration {args.adaptive_densify_from_iter} to {args.adaptive_densify_until_iter}, every {args.adaptive_densify_interval} iterations.")
     else:
         mesh_config = None
     
